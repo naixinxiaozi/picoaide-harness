@@ -69,6 +69,8 @@ services:
     image: ${SERVER_IMAGE:-picoaide-harness-server:latest}
     container_name: picoaide-server
     restart: unless-stopped
+    ports:
+      - 8080:8080
     # 仅内网可达(经 Caddy),不发布宿主机端口
     expose:
       - "8080"
@@ -203,6 +205,8 @@ services:
     image: ${PG_IMAGE:-postgres:18-alpine}
     container_name: picoaide-postgres
     restart: unless-stopped
+    ports:
+      - 5432:5432
     environment:
       POSTGRES_USER: picoaide
       POSTGRES_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD must be set in .env}
