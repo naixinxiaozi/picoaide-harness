@@ -10,6 +10,8 @@ export interface ClientPrincipal {
   userId: number;
   username: string;
   role: string;
+  /** users.is_admin（1=管理员）。Go 侧可见性判据多处用 IsAdmin 而非 role。 */
+  isAdmin: number;
 }
 
 /** 当前管理端用户（AdminAuth 注入）。 */

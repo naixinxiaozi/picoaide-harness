@@ -6,10 +6,13 @@ import {
   HttpStatus,
   Param,
   Post,
+  Res,
   UseGuards,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { BearerAuthGuard } from '../common/guards/bearer-auth.guard';
 import { CurrentUser, type ClientPrincipal } from '../common/decorators';
+import { writeArchiveResponse } from '../shared-skills/archive-response';
 import { AgentPresetsService } from './agent-presets.service';
 
 @Controller('api/client/v2/agent-presets')
@@ -29,28 +32,26 @@ export class AgentPresetsController {
 
   @Post()
   @HttpCode(HttpStatus.CREATED)
-  async upload(
-    @Body() body: Record<string, unknown>,
-    @CurrentUser() user: ClientPrincipal,
-  ) {
+  async upload(@Body() body: Record<string, unknown>, @CurrentUser() user: ClientPrincipal) {
     const result = await this.presets.upload(body, user.username);
     return { preset: result };
   }
 
+  /** 无版本号的下载：取最高已通过版本，否则取最新版本（与 Go latestPresetRelease 一致）。 */
   @Get(':name/archive')
   async archive(
     @Param('name') name: string,
     @CurrentUser() user: ClientPrincipal,
-  ) {
-    await this.presets.downloadForEmployee(
+    @Res() res: Response,
+  ): Promise<void> {
+    const payload = await this.presets.downloadForEmployee(
       name,
       undefined,
       user.username,
       user.role,
       user.userId,
     );
-    // 到达此处即命中 404（无归档字节列）；返回值仅为满足类型。
-    return undefined;
+    writeArchiveResponse(res, payload, 'X-Preset-Version', 'X-Preset-Checksum');
   }
 
   @Get(':name/:version/archive')
@@ -58,14 +59,15 @@ export class AgentPresetsController {
     @Param('name') name: string,
     @Param('version') version: string,
     @CurrentUser() user: ClientPrincipal,
-  ) {
-    await this.presets.downloadForEmployee(
+    @Res() res: Response,
+  ): Promise<void> {
+    const payload = await this.presets.downloadForEmployee(
       name,
       version,
       user.username,
       user.role,
       user.userId,
     );
-    return undefined;
+    writeArchiveResponse(res, payload, 'X-Preset-Version', 'X-Preset-Checksum');
   }
 }

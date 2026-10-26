@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { SessionUser } from '~/lib/nav'
+import { fmtMoney, fmtTokens1, fmtTime } from '~/lib/usage'
 
 interface UserItem {
   id: number
@@ -68,12 +69,14 @@ const error = ref('')
 const departments = ref<DepartmentItem[]>([])
 
 const columns = [
+  { accessorKey: 'id', header: 'ID' },
   { accessorKey: 'username', header: '用户名' },
-  { accessorKey: 'display_name', header: '显示名' },
-  { accessorKey: 'email', header: '邮箱' },
+  { accessorKey: 'groups', header: '部门' },
   { accessorKey: 'role', header: '角色' },
   { accessorKey: 'status', header: '状态' },
+  { accessorKey: 'monthly_usage', header: '本月消费' },
   { accessorKey: 'balance_money', header: '余额' },
+  { accessorKey: 'password_changed_at', header: '上次改密' },
   { id: 'actions', header: '操作' },
 ]
 
@@ -398,9 +401,17 @@ async function onRevokeToken(token: TokenItem) {
           @update:model-value="(v: boolean) => onToggleStatus(row.original, v)"
         />
       </template>
-
+      <template #monthly_usage-cell="{ row }">
+        <span v-if="row.original.is_admin">豁免</span>
+        <template v-else>
+          <div class="tabular-nums">￥{{ fmtMoney(row.original.monthly_cost) }}</div>
+          <div class="tabular-nums">{{ fmtTokens1(row.original.monthly_usage) }} tokens</div>
+        </template>
+      </template>
+      
       <template #balance_money-cell="{ row }">
-        <span class="tabular-nums">¥{{ Number(row.original.balance_money ?? 0).toFixed(2) }}</span>
+        <span v-if="row.original.balance_activated" class="tabular-nums">¥{{ Number(row.original.balance_money ?? 0).toFixed(2) }}</span>
+        <span v-else>未开通</span>
       </template>
 
       <template #actions-cell="{ row }">

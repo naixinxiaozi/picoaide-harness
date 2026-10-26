@@ -9,6 +9,7 @@ import {
 import type { Response } from 'express';
 import { CurrentUser, type ClientPrincipal } from '../common/decorators';
 import { BearerAuthGuard } from '../common/guards/bearer-auth.guard';
+import { sendArchive } from './archive-response';
 import { MarketplaceService } from './marketplace.service';
 
 /**
@@ -38,14 +39,15 @@ export class MarketplaceController {
   }
 
   @Get('marketplace/skills/:name/archive')
-  downloadArchive(
+  async downloadArchive(
     @Param('name') name: string,
     @CurrentUser() p: ClientPrincipal,
+    @Res() res: Response,
   ) {
-    // 授权判定先行（未授权 404），再尝试归档。
-    return this.svc
-      .getMarketSkill(name, p.username, p.role, p.userId)
-      .then(() => this.svc.downloadSkillArchive(name));
+    // 可见性判定先行（未授权/下架 404，不泄露存在性），再发归档字节。
+    await this.svc.getMarketSkill(name, p.username, p.role, p.userId);
+    const payload = await this.svc.downloadSkillArchive(name);
+    sendArchive(res, payload, 'X-Skill');
   }
 
   @Get('skills/builtin')

@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, desc, eq, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/database.module';
 import {
   balanceGrantItems,
@@ -458,13 +458,15 @@ export class BalanceService {
   ): Promise<{ coverDebtUsers: number; coverDebtAmount: number }> {
     return this.db.transaction(async (tx) => {
       if (mode === 'cover') {
-        const rows = await tx.execute<{ id: number; balance_money: number }>(
-          sql`SELECT id, balance_money FROM users WHERE id = ANY(${ids}::bigint[]) FOR UPDATE`,
-        );
+        const rows = await tx
+          .select({ id: users.id, balanceMoney: users.balanceMoney })
+          .from(users)
+          .where(inArray(users.id, ids))
+          .for('update');
         let coverDebtUsers = 0;
         let coverDebtAmount = 0;
         for (const r of rows) {
-          const old = roundMicro(r.balance_money);
+          const old = roundMicro(r.balanceMoney);
           if (old !== 0) {
             await tx.insert(balanceLedger).values({
               userId: r.id,
@@ -482,10 +484,14 @@ export class BalanceService {
             coverDebtAmount += -old;
           }
         }
-        await tx.execute(sql`
-          UPDATE users SET balance_money = ${amount}, balance_activated_at = COALESCE(balance_activated_at, now()), updated_at = now()
-          WHERE id = ANY(${ids}::bigint[])
-        `);
+        await tx
+          .update(users)
+          .set({
+            balanceMoney: amount,
+            balanceActivatedAt: sql`COALESCE(${users.balanceActivatedAt}, now())`,
+            updatedAt: sql`now()`,
+          })
+          .where(inArray(users.id, ids));
         for (const r of rows) {
           await tx.insert(balanceLedger).values({
             userId: r.id,
@@ -501,17 +507,21 @@ export class BalanceService {
         return { coverDebtUsers, coverDebtAmount };
       }
       // add
-      const updated = await tx.execute<{ id: number; balance_money: number }>(sql`
-        UPDATE users SET balance_money = balance_money + ${amount}, balance_activated_at = COALESCE(balance_activated_at, now()), updated_at = now()
-        WHERE id = ANY(${ids}::bigint[])
-        RETURNING id, balance_money
-      `);
+      const updated = await tx
+        .update(users)
+        .set({
+          balanceMoney: sql`${users.balanceMoney} + ${amount}`,
+          balanceActivatedAt: sql`COALESCE(${users.balanceActivatedAt}, now())`,
+          updatedAt: sql`now()`,
+        })
+        .where(inArray(users.id, ids))
+        .returning({ id: users.id, balanceMoney: users.balanceMoney });
       for (const r of updated) {
         await tx.insert(balanceLedger).values({
           userId: r.id,
           kind: 'grant',
           amount,
-          balanceAfter: r.balance_money,
+          balanceAfter: r.balanceMoney,
           reason: '月度发放',
           actor,
           usageId: null,

@@ -1,23 +1,24 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { and, eq } from 'drizzle-orm';
 import { DRIZZLE, type Database } from '../db/database.module';
-import {
-  agentPresetGrants,
-  agentPresets,
-  capabilityLocks,
-  sharedSkillGrants,
-  sharedSkills,
-  skillGrants,
-  skills,
-  type AgentPreset,
-  type SharedSkill,
-} from '../db/schema';
+import { capabilityLocks, type App, type AppRelease } from '../db/schema';
 import { ApiError } from '../common/errors/api-error';
+import { formatDateTime } from '../common/skills-shared';
+import { resolveUserEffectiveGroups } from '../common/effective-groups';
 import {
-  formatDateTime,
-  granteeMatch,
-  resolveUserGroupNames,
-} from '../common/skills-shared';
+  CHANNEL_MARKET,
+  CHANNEL_ORG,
+  STATUS_APPROVED,
+  accessibleAppIds,
+  compareVersions,
+  delivered,
+  distributionOf,
+  distributionStates,
+  listApps,
+  listReleasesByStatus,
+  ownedBy,
+  type Distribution,
+} from '../common/apps-shared';
 
 export interface CapabilityItem {
   kind: 'skill' | 'agent';
@@ -61,25 +62,21 @@ export interface ApprovalRow {
   enabled: boolean;
 }
 
-/** 数值感知的 semver 比较：a<b → -1，a==b → 0，a>b → 1。 */
-function compareSemVer(a: string, b: string): number {
-  const pa = a.split(/[.-]/);
-  const pb = b.split(/[.-]/);
-  const len = Math.max(pa.length, pb.length);
-  for (let i = 0; i < len; i++) {
-    const x = pa[i] ?? '';
-    const y = pb[i] ?? '';
-    const nx = Number(x);
-    const ny = Number(y);
-    const xNum = x !== '' && !Number.isNaN(nx);
-    const yNum = y !== '' && !Number.isNaN(ny);
-    if (xNum && yNum) {
-      if (nx !== ny) return nx < ny ? -1 : 1;
-    } else if (x !== y) {
-      return x < y ? -1 : 1;
-    }
+type CapKind = 'skill' | 'agent';
+
+/** 某 app 的最高 approved（未软删）版本；无则 null（Go currentRelease）。 */
+function highestApproved(releases: AppRelease[], appId: string): AppRelease | null {
+  let best: AppRelease | null = null;
+  for (const r of releases) {
+    if (r.appId !== appId || r.deletedAt || r.status !== STATUS_APPROVED) continue;
+    if (!best || compareVersions(r.version, best.version) > 0) best = r;
   }
-  return 0;
+  return best;
+}
+
+/** 归属人视图判据：只有归属人自己（官方内容 owner 为空，不属于任何人）。 */
+function isDelisted(d: Distribution): boolean {
+  return d.exists && (!d.enabled || d.deleted);
 }
 
 @Injectable()
@@ -91,7 +88,7 @@ export class CapabilitiesService {
   }
 
   private item(
-    kind: 'skill' | 'agent',
+    kind: CapKind,
     source: 'market' | 'org',
     name: string,
     displayName: string,
@@ -99,8 +96,13 @@ export class CapabilitiesService {
     description: string,
     author: string,
     status: string,
+    official: boolean,
+    downloads: number,
+    calls: number,
     isOwner: boolean,
     delisted: boolean,
+    reason = '',
+    quality = '',
   ): CapabilityItem {
     return {
       kind,
@@ -111,9 +113,11 @@ export class CapabilitiesService {
       description,
       author,
       status,
-      official: false,
-      downloads: 0,
-      calls: 0,
+      ...(reason ? { reason } : {}),
+      ...(quality ? { quality } : {}),
+      official,
+      downloads,
+      calls,
       score: 0,
       is_owner: isOwner,
       delisted,
@@ -121,7 +125,15 @@ export class CapabilitiesService {
     };
   }
 
-  /** 员工面能力中心聚合（三源合并）。 */
+  /**
+   * 员工面能力中心聚合（apps 统一模型）。
+   *
+   * 三个分区（与 Go capabilities.listCapabilities 同口径）：
+   *   market —— kind 对应 channel='market' 且已上架；admin 全量，否则 app_grants 授权；
+   *   org    —— channel='org' 且已上架；admin 全量 approved，否则「归属人」或「approved + 授权」，
+   *             该分区只展示 approved；
+   *   own    —— 归属人的全部版本（任意状态、忽略下架；下架行 delisted=true）。
+   */
   async list(
     query: { source?: string; type?: string },
     username: string,
@@ -134,186 +146,270 @@ export class CapabilitiesService {
     const includeOwn = src === 'own' || src === 'local';
     const ft = this.parseType(query?.type);
     const admin = this.adminFull(role);
-    const groups = await resolveUserGroupNames(this.db, userId);
+    const groups = admin ? [] : await resolveUserEffectiveGroups(this.db, userId);
+
+    const wantSkills = ft.skills && (includeMarket || includeOrg || includeOwn);
+    const wantAgents = ft.agents && (includeMarket || includeOrg || includeOwn);
+
+    const [skillDists, agentDists, skillApps, agentApps] = await Promise.all([
+      wantSkills ? distributionStates(this.db, 'skill') : new Map<string, Distribution>(),
+      wantAgents ? distributionStates(this.db, 'agent') : new Map<string, Distribution>(),
+      wantSkills ? listApps(this.db, 'skill') : Promise.resolve([] as App[]),
+      wantAgents ? listApps(this.db, 'agent') : Promise.resolve([] as App[]),
+    ]);
+
+    // 一次取齐该 kind 的全部未软删版本（含任意状态）；市场展示版本 = 最高 approved。
+    const [skillReleases, agentReleases] = await Promise.all([
+      wantSkills ? listReleasesByStatus(this.db, 'skill') : Promise.resolve([] as AppRelease[]),
+      wantAgents ? listReleasesByStatus(this.db, 'agent') : Promise.resolve([] as AppRelease[]),
+    ]);
 
     const items: CapabilityItem[] = [];
+    const skillById = new Map(skillApps.map((a) => [a.appId, a] as const));
+    const agentById = new Map(agentApps.map((a) => [a.appId, a] as const));
 
-    // 1) 市场技能（授权制）。
+    // ---------------------------------------------------------------- 市场技能
     if (includeMarket && ft.skills) {
-      const rows = await this.db
-        .select()
-        .from(skills)
-        .where(eq(skills.enabled, 1))
-        .orderBy(skills.name);
-      let grantedSet = new Set<string>();
-      if (!admin) {
-        const granted = await this.db
-          .selectDistinct({ name: skillGrants.skillName })
-          .from(skillGrants)
-          .where(granteeMatch(username, groups));
-        grantedSet = new Set(granted.map((g) => g.name));
-      }
-      for (const s of rows) {
-        if (!admin && !grantedSet.has(s.name)) continue;
+      const allowed = admin
+        ? null
+        : new Set(await accessibleAppIds(this.db, 'skill', username, groups));
+      for (const a of skillApps) {
+        if (a.channel !== CHANNEL_MARKET || a.enabled !== 1 || a.deletedAt) continue;
+        if (allowed && !allowed.has(a.appId)) continue;
+        const r = highestApproved(skillReleases, a.appId);
+        const d = distributionOf(skillDists, a.appId);
         items.push(
           this.item(
             'skill',
             'market',
-            s.name,
-            s.displayName,
-            s.version,
-            s.description,
-            s.author,
-            'approved',
-            s.author === username,
+            a.appId,
+            a.title,
+            r?.version ?? '',
+            a.description || r?.description || '',
+            a.owner,
+            STATUS_APPROVED,
+            a.official === 1,
+            r?.downloads ?? 0,
+            r?.calls ?? 0,
+            ownedBy(d, username),
             false,
           ),
         );
       }
     }
 
-    // 2) 组织·共享技能（审核 + 授权）。
-    if (includeOrg && ft.skills) {
-      const rows = await this.db
-        .select()
-        .from(sharedSkills)
-        .orderBy(sharedSkills.name, sharedSkills.version);
-      let grantedSet = new Set<string>();
-      if (!admin) {
-        const granted = await this.db
-          .selectDistinct({ name: sharedSkillGrants.skillName })
-          .from(sharedSkillGrants)
-          .where(granteeMatch(username, groups));
-        grantedSet = new Set(granted.map((g) => g.name));
+    // -------------------------------------------------------------- 市场智能体
+    if (includeMarket && ft.agents) {
+      const allowed = admin
+        ? null
+        : new Set(await accessibleAppIds(this.db, 'agent', username, groups));
+      for (const a of agentApps) {
+        if (a.channel !== CHANNEL_MARKET || a.enabled !== 1 || a.deletedAt) continue;
+        if (allowed && !allowed.has(a.appId)) continue;
+        const r = highestApproved(agentReleases, a.appId);
+        if (!r) continue; // 无 approved 版本的市场智能体不可见
+        const d = distributionOf(agentDists, a.appId);
+        items.push(
+          this.item(
+            'agent',
+            'market',
+            a.appId,
+            a.title,
+            r.version,
+            a.description,
+            a.owner,
+            STATUS_APPROVED,
+            a.official === 1,
+            r.downloads,
+            r.calls,
+            ownedBy(d, username),
+            false,
+          ),
+        );
       }
-      for (const s of rows) {
-        const visible = admin
-          ? s.status === 'approved'
-          : s.author === username || (s.status === 'approved' && grantedSet.has(s.name));
-        if (!visible) continue;
-        // 组织分区只展示 approved（作者 own 的 pending/rejected 由「我的」分区展示）。
-        if (s.status !== 'approved') continue;
+    }
+
+    // -------------------------------------------------------- 组织共享技能（org）
+    if (includeOrg && ft.skills) {
+      const allowed = admin
+        ? null
+        : new Set(await accessibleAppIds(this.db, 'skill', username, groups));
+      for (const r of skillReleases) {
+        const a = skillById.get(r.appId);
+        if (!a || a.channel !== CHANNEL_ORG || a.deletedAt) continue;
+        const d = distributionOf(skillDists, r.appId);
+        if (!delivered(d)) continue;
+        const owner = ownedBy(d, username);
+        if (!admin) {
+          // 组织分区只展示 approved：归属人的 pending/rejected 归「我的」分区。
+          if (r.status !== STATUS_APPROVED) continue;
+          if (!owner && !allowed?.has(r.appId)) continue;
+        } else if (r.status !== STATUS_APPROVED) {
+          continue;
+        }
         items.push(
           this.item(
             'skill',
             'org',
-            s.name,
-            s.displayName,
-            s.version,
-            s.description,
-            s.author,
-            s.status,
-            s.author === username,
+            r.appId,
+            r.title,
+            r.version,
+            r.description,
+            r.publisher || a.owner,
+            r.status,
+            a.official === 1,
+            r.downloads,
+            r.calls,
+            owner,
             false,
+            r.reason,
+            r.quality,
           ),
         );
       }
     }
 
-    // 3) 组织·共享 Agent（审核 + 授权）。市场智能体与共享预设共用 agentPresets
-    // 表且无 channel 列，此处统一按 org 呈现（schema 局限，见报告）。
+    // -------------------------------------------------------- 组织共享 Agent（org）
     if (includeOrg && ft.agents) {
-      const rows = await this.db
-        .select()
-        .from(agentPresets)
-        .orderBy(agentPresets.name, agentPresets.version);
-      let grantedSet = new Set<string>();
-      if (!admin) {
-        const granted = await this.db
-          .selectDistinct({ name: agentPresetGrants.presetName })
-          .from(agentPresetGrants)
-          .where(granteeMatch(username, groups));
-        grantedSet = new Set(granted.map((g) => g.name));
-      }
-      for (const p of rows) {
-        const visible = admin
-          ? p.status === 'approved'
-          : p.author === username || (p.status === 'approved' && grantedSet.has(p.name));
-        if (!visible) continue;
-        if (p.status !== 'approved') continue;
+      const allowed = admin
+        ? null
+        : new Set(await accessibleAppIds(this.db, 'agent', username, groups));
+      for (const r of agentReleases) {
+        const a = agentById.get(r.appId);
+        if (!a || a.channel !== CHANNEL_ORG || a.deletedAt) continue;
+        const d = distributionOf(agentDists, r.appId);
+        if (!delivered(d)) continue;
+        const owner = ownedBy(d, username);
+        if (!admin) {
+          if (r.status !== STATUS_APPROVED) continue;
+          if (!owner && !allowed?.has(r.appId)) continue;
+        } else if (r.status !== STATUS_APPROVED) {
+          continue;
+        }
         items.push(
           this.item(
             'agent',
             'org',
-            p.name,
-            p.displayName,
-            p.version,
-            p.description,
-            p.author,
-            p.status,
-            p.author === username,
+            r.appId,
+            r.title,
+            r.version,
+            r.description,
+            r.publisher || a.owner,
+            r.status,
+            a.official === 1,
+            r.downloads,
+            r.calls,
+            owner,
             false,
+            r.reason,
+            r.quality,
           ),
         );
       }
     }
 
-    // 4) 「我的」分区：归属人自己的行（任意状态 + 下架标记）。
+    // --------------------------------------------- 「我的」：归属人的全部版本
     if (includeOwn) {
       if (ft.skills) {
-        const owned = await this.db
-          .select()
-          .from(sharedSkills)
-          .where(eq(sharedSkills.author, username))
-          .orderBy(sharedSkills.name, sharedSkills.version);
-        for (const s of owned) {
+        // 组织渠道：任意状态、忽略上下架（下架只挡分发面）。
+        for (const r of skillReleases) {
+          const a = skillById.get(r.appId);
+          if (!a || a.channel !== CHANNEL_ORG) continue;
+          const d = distributionOf(skillDists, r.appId);
+          if (!ownedBy(d, username)) continue;
           items.push(
             this.item(
               'skill',
               'org',
-              s.name,
-              s.displayName,
-              s.version,
-              s.description,
-              s.author,
-              s.status,
+              r.appId,
+              r.title,
+              r.version,
+              r.description,
+              r.publisher || a.owner,
+              r.status,
+              a.official === 1,
+              r.downloads,
+              r.calls,
               true,
-              false,
+              isDelisted(d),
+              r.reason,
+              r.quality,
             ),
           );
         }
-        // 市场技能的归属行（下架仍可见，delisted=true）。
-        const marketOwned = await this.db
-          .select()
-          .from(skills)
-          .where(eq(skills.author, username))
-          .orderBy(skills.name);
-        for (const s of marketOwned) {
+        // 市场渠道：仍可见，delisted=true。
+        for (const a of skillApps) {
+          if (a.channel !== CHANNEL_MARKET) continue;
+          const d = distributionOf(skillDists, a.appId);
+          if (!ownedBy(d, username)) continue;
+          const r = highestApproved(skillReleases, a.appId);
+          if (!r) continue;
           items.push(
             this.item(
               'skill',
               'market',
-              s.name,
-              s.displayName,
-              s.version,
-              s.description,
-              s.author,
-              'approved',
+              a.appId,
+              a.title,
+              r.version,
+              a.description,
+              a.owner,
+              STATUS_APPROVED,
+              a.official === 1,
+              r.downloads,
+              r.calls,
               true,
-              s.enabled !== 1,
+              isDelisted(d),
             ),
           );
         }
       }
       if (ft.agents) {
-        const owned = await this.db
-          .select()
-          .from(agentPresets)
-          .where(eq(agentPresets.author, username))
-          .orderBy(agentPresets.name, agentPresets.version);
-        for (const p of owned) {
+        for (const r of agentReleases) {
+          const a = agentById.get(r.appId);
+          if (!a || a.channel !== CHANNEL_ORG) continue;
+          const d = distributionOf(agentDists, r.appId);
+          if (!ownedBy(d, username)) continue;
           items.push(
             this.item(
               'agent',
               'org',
-              p.name,
-              p.displayName,
-              p.version,
-              p.description,
-              p.author,
-              p.status,
+              r.appId,
+              r.title,
+              r.version,
+              r.description,
+              r.publisher || a.owner,
+              r.status,
+              a.official === 1,
+              r.downloads,
+              r.calls,
               true,
-              false,
+              isDelisted(d),
+              r.reason,
+              r.quality,
+            ),
+          );
+        }
+        for (const a of agentApps) {
+          if (a.channel !== CHANNEL_MARKET) continue;
+          const d = distributionOf(agentDists, a.appId);
+          if (!ownedBy(d, username)) continue;
+          const r = highestApproved(agentReleases, a.appId);
+          if (!r) continue;
+          items.push(
+            this.item(
+              'agent',
+              'market',
+              a.appId,
+              a.title,
+              r.version,
+              a.description,
+              a.owner,
+              STATUS_APPROVED,
+              a.official === 1,
+              r.downloads,
+              r.calls,
+              true,
+              isDelisted(d),
             ),
           );
         }
@@ -322,9 +418,7 @@ export class CapabilitiesService {
 
     const merged = this.mergeVersions(items);
     const folded = src === 'market' ? this.mergeMarketFirst(merged) : merged;
-    const finalItems =
-      src !== 'own' && src !== 'local' ? this.sortCatalog(this.scoreItems(folded)) : folded;
-    return finalItems;
+    return src !== 'own' && src !== 'local' ? this.sortCatalog(this.scoreItems(folded)) : folded;
   }
 
   private parseType(t: string | undefined): { skills: boolean; agents: boolean } {
@@ -355,18 +449,18 @@ export class CapabilitiesService {
     }
     const out: CapabilityItem[] = [];
     for (const arr of byKey.values()) {
-      const approved = arr.filter((i) => i.status === 'approved');
+      const approved = arr.filter((i) => i.status === STATUS_APPROVED);
       const display =
         approved.length > 0
           ? approved.reduce((best, i) =>
-              compareSemVer(i.version, best.version) > 0 ? i : best,
+              compareVersions(i.version, best.version) > 0 ? i : best,
             )
           : arr[0];
       const versions = approved
         .map((i) => i.version)
-        .sort(compareSemVer)
+        .sort(compareVersions)
         .filter((v, i, a) => a.indexOf(v) === i);
-      if (display.status === 'approved' && versions.length === 0) {
+      if (display.status === STATUS_APPROVED && versions.length === 0) {
         versions.push(display.version);
       }
       const quality = arr.find((i) => i.quality === 'featured')?.quality ?? '';
@@ -390,7 +484,7 @@ export class CapabilitiesService {
       }
       const versions = Array.from(
         new Set([...cur.versions, cur.version, ...it.versions, it.version]),
-      ).sort(compareSemVer);
+      ).sort(compareVersions);
       if (cur.source === 'market') {
         byKey.set(k, { ...cur, versions });
       } else if (it.source === 'market') {
@@ -420,80 +514,83 @@ export class CapabilitiesService {
 
   // ------------------------------------------------------------ admin approvals
 
-  async approvals(query: {
-    status?: string;
-    type?: string;
-  }): Promise<ApprovalRow[]> {
+  /**
+   * 管理端审核队列：组织渠道（channel='org'）的版本按状态汇总，
+   * 技能与智能体分别来自 app_releases(kind=...)。
+   * DTO 形状（含 base_path / grants_base / preview_path）保持不变：
+   * 审核动作仍落在 shared-skills / agent-presets 端点，经 setReleaseStatusForReview 裁决。
+   */
+  async approvals(query: { status?: string; type?: string }): Promise<ApprovalRow[]> {
     const status = query?.status || 'pending';
     const ft = this.parseType(query?.type);
-    const out: ApprovalRow[] = [];
     const statusFilter = status === 'all' ? undefined : status;
+    const out: ApprovalRow[] = [];
 
     if (ft.skills) {
-      const rows = await this.db
-        .select()
-        .from(sharedSkills)
-        .where(
-          statusFilter
-            ? eq(sharedSkills.status, statusFilter as SharedSkill['status'])
-            : undefined,
-        )
-        .orderBy(sharedSkills.name, sharedSkills.version);
-      for (const s of rows) {
+      const [apps, dists, rows] = await Promise.all([
+        listApps(this.db, 'skill', CHANNEL_ORG),
+        distributionStates(this.db, 'skill'),
+        listReleasesByStatus(this.db, 'skill', statusFilter),
+      ]);
+      const byId = new Map(apps.map((a) => [a.appId, a] as const));
+      for (const r of rows) {
+        const a = byId.get(r.appId);
+        if (!a) continue;
+        const d = distributionOf(dists, r.appId);
         out.push({
           kind: 'skill',
-          name: s.name,
-          version: s.version,
-          display_name: s.displayName,
-          description: s.description,
-          author: s.author,
-          owner: s.author,
-          status: s.status,
-          reason: s.reason,
-          quality: '',
-          created_at: formatDateTime(s.createdAt),
-          downloads: 0,
-          calls: 0,
-          base_path: `/api/server/admin/shared-skills/${s.name}/${s.version}`,
-          grants_base: `/api/server/admin/shared-skills/${s.name}`,
-          preview_path: `/api/server/admin/shared-skills/${s.name}/${s.version}/preview`,
+          name: r.appId,
+          version: r.version,
+          display_name: r.title || a.title || r.appId,
+          description: r.description,
+          author: r.publisher,
+          owner: a.owner,
+          status: r.status,
+          reason: r.reason,
+          quality: r.quality,
+          created_at: formatDateTime(r.createdAt),
+          downloads: r.downloads,
+          calls: r.calls,
+          base_path: `/api/server/admin/shared-skills/${r.appId}/${r.version}`,
+          grants_base: `/api/server/admin/shared-skills/${r.appId}`,
+          preview_path: `/api/server/admin/shared-skills/${r.appId}/${r.version}/preview`,
           conflict: false,
-          official: false,
-          enabled: true,
+          official: a.official === 1,
+          enabled: delivered(d),
         });
       }
     }
 
     if (ft.agents) {
-      const rows = await this.db
-        .select()
-        .from(agentPresets)
-        .where(
-          statusFilter
-            ? eq(agentPresets.status, statusFilter as AgentPreset['status'])
-            : undefined,
-        )
-        .orderBy(agentPresets.name, agentPresets.version);
-      for (const p of rows) {
+      const [apps, dists, rows] = await Promise.all([
+        listApps(this.db, 'agent', CHANNEL_ORG),
+        distributionStates(this.db, 'agent'),
+        listReleasesByStatus(this.db, 'agent', statusFilter),
+      ]);
+      const byId = new Map(apps.map((a) => [a.appId, a] as const));
+      for (const r of rows) {
+        const a = byId.get(r.appId);
+        if (!a) continue;
+        const d = distributionOf(dists, r.appId);
         out.push({
           kind: 'agent',
-          name: p.name,
-          version: p.version,
-          display_name: p.displayName,
-          description: p.description,
-          author: p.author,
-          owner: p.author,
-          status: p.status,
-          reason: p.reason,
-          quality: '',
-          created_at: formatDateTime(p.createdAt),
-          downloads: 0,
-          base_path: `/api/server/admin/agent-presets/${p.name}/${p.version}`,
-          grants_base: `/api/server/admin/agent-presets/${p.name}`,
-          preview_path: `/api/server/admin/agent-presets/${p.name}/${p.version}/preview`,
+          name: r.appId,
+          version: r.version,
+          display_name: r.title || a.title || r.appId,
+          description: r.description,
+          author: r.publisher,
+          owner: a.owner,
+          status: r.status,
+          reason: r.reason,
+          quality: r.quality,
+          created_at: formatDateTime(r.createdAt),
+          downloads: r.downloads,
+          base_path: `/api/server/admin/agent-presets/${r.appId}/${r.version}`,
+          grants_base: `/api/server/admin/agent-presets/${r.appId}`,
+          preview_path: `/api/server/admin/agent-presets/${r.appId}/${r.version}/preview`,
           conflict: false,
-          official: false,
-          enabled: true,
+          official: a.official === 1,
+          enabled: delivered(d),
         });
       }
     }

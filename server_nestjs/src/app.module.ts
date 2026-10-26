@@ -30,6 +30,7 @@ import { ServerInfoModule } from './server-info/server-info.module';
 import { SharedSkillsModule } from './shared-skills/shared-skills.module';
 import { TelemetryModule } from './telemetry/telemetry.module';
 import { UsageModule } from './usage/usage.module';
+import { AppstoreModule } from './appstore/appstore.module';
 
 @Module({
   imports: [
@@ -63,6 +64,7 @@ import { UsageModule } from './usage/usage.module';
     SharedSkillsModule,
     TelemetryModule,
     UsageModule,
+    AppstoreModule,
   ],
   providers: [DatabaseService],
 })

@@ -1,6 +1,7 @@
 import {
   bigint,
   bigserial,
+  doublePrecision,
   index,
   integer,
   pgTable,
@@ -24,6 +25,8 @@ export const groups = pgTable(
     parentId: integer('parent_id').notNull().default(0),
     leaderId: integer('leader_id').notNull().default(0),
     description: text('description').notNull().default(''),
+    /** 部门预算（已下线特性，仅保留列，重写不读写）。 */
+    budgetMoney: doublePrecision('budget_money'),
     createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' })
       .notNull()
       .defaultNow(),

@@ -115,8 +115,13 @@ export interface ReportSubscription {
 }
 
 /** 金额：两位小数，元。 */
-export function fmtMoney(value: number): string {
-  return `¥${Number(value ?? 0).toFixed(2)}`
+// 金额紧凑格式:>=1e6 → 123.5万,>=1e4 → 1.2万,>=1000 → 1,234,其余两位小数
+export function fmtMoney(n: number): string {
+  if (!isFinite(n)) return '—'
+  if (n >= 1_000_000) return `${Number((n / 10000).toFixed(1))}万`
+  if (n >= 10000) return `${Number((n / 10000).toFixed(1))}万`
+  if (n >= 1000) return n.toLocaleString('zh-CN', { maximumFractionDigits: 0 })
+  return n.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
 
 /** 整数：千分位。 */
@@ -127,6 +132,12 @@ export function fmtInt(value: number): string {
 /** token 合计（prompt + completion）。 */
 export function fmtTokens(row: Pick<UsageAggregateRow, 'prompt_tokens' | 'completion_tokens'>): string {
   return fmtInt(Number(row.prompt_tokens ?? 0) + Number(row.completion_tokens ?? 0))
+}
+
+export function fmtTokens1(n: number): string {
+  if (n >= 1000000) return `${Number((n / 1000000).toFixed(1))}M`
+  if (n >= 1000) return `${Number((n / 1000).toFixed(1))}K`
+  return String(n)
 }
 
 /** RFC3339 → 本地可读时间。 */

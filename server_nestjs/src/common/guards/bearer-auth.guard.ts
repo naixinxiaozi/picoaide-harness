@@ -57,6 +57,7 @@ export class BearerAuthGuard implements CanActivate {
       userId: row.user.id,
       username: row.user.username,
       role: row.user.role,
+      isAdmin: row.user.isAdmin,
     };
     (req as Request & { user: ClientPrincipal }).user = principal;
     return true;

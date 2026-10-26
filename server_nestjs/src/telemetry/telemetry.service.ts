@@ -1,10 +1,17 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, eq } from 'drizzle-orm';
 import { DRIZZLE, type Database } from '../db/database.module';
-import { clientErrorReportingStatus, skills, skillGrants } from '../db/schema';
+import { clientErrorReportingStatus } from '../db/schema';
 import { ApiError } from '../common/errors/api-error';
 import { resolveUserEffectiveGroups } from '../common/effective-groups';
-import { granteeMatch } from '../common/skills-shared';
+import {
+  accessibleAppIds,
+  appDistribution,
+  currentRelease,
+  delivered,
+  getRelease,
+  incrementReleaseCall,
+  ownedBy,
+} from '../common/apps-shared';
 import { SlidingWindowLimiter } from '../common/rate-limiter';
 import type { ClientPrincipal } from '../common/decorators';
 
@@ -112,9 +119,9 @@ export class TelemetryService {
     }
 
     try {
-      const allowed = await this.skillCallTargetAllowed(user, name);
-      if (!allowed) return { ok: true }; // 不可见技能：静默 200 不持久化
-      // 计数持久化：重写 schema 无 app_releases.calls 计数表，no-op（见报告）。
+      const target = await this.skillCallTargetAllowed(user, name, version);
+      if (!target) return { ok: true }; // 不可见/本地技能：静默 200 不计数
+      await incrementReleaseCall(this.db, 'skill', name, target);
       return { ok: true };
     } catch {
       throw new ApiError('INTERNAL', '记录失败');
@@ -172,24 +179,32 @@ export class TelemetryService {
     }
   }
 
-  /** 技能可见性：非商城技能 → 允许；管理员全量；否则按授权过滤。 */
+  /**
+   * 判定本次上报的计数目标（Go skillCallTargetAllowed）。
+   * 返回 null = 本地/不存在技能（不计数）；返回 version = 应计数到哪个版本行。
+   * 口径：目标版本存在 ⇒ 必须已上架（Delivered）；admin 免授权仍需上架；
+   * 归属人本人免授权；其余须经 app_grants 授权（严格默认拒绝）。
+   */
   private async skillCallTargetAllowed(
     user: ClientPrincipal,
     name: string,
-  ): Promise<boolean> {
-    const rows = await this.db
-      .select({ name: skills.name })
-      .from(skills)
-      .where(and(eq(skills.name, name), eq(skills.enabled, 1)))
-      .limit(1);
-    if (rows.length === 0) return true; // 本地/内置技能：不限制
-    if (user.role === 'super_admin') return true;
+    version: string,
+  ): Promise<string | null> {
+    // 解析计数落点：带 version 精确命中；不带回落展示版本。
+    const target =
+      version === ''
+        ? await currentRelease(this.db, 'skill', name)
+        : await getRelease(this.db, 'skill', name, version);
+    if (!target) return null; // 本地创作技能：静默成功
+
+    const dist = await appDistribution(this.db, 'skill', name);
+    if (!delivered(dist)) return null; // 下架即不得计数
+    // Go: user.IsAdmin 由 role 派生（IsAdmin ⇔ role==super_admin）。
+    if (user.role === 'super_admin') return target.version;
+    if (ownedBy(dist, user.username)) return target.version;
 
     const groups = await resolveUserEffectiveGroups(this.db, user.userId);
-    const granted = await this.db
-      .select({ skillName: skillGrants.skillName })
-      .from(skillGrants)
-      .where(and(granteeMatch(user.username, groups), eq(skillGrants.skillName, name)));
-    return granted.length > 0;
+    const ids = await accessibleAppIds(this.db, 'skill', user.username, groups);
+    return ids.includes(name) ? target.version : null;
   }
 }

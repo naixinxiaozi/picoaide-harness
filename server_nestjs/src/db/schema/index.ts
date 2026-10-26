@@ -1,14 +1,16 @@
 /**
  * Drizzle schema 汇总：re-export 全部表定义与类型。
  * 所有业务模块统一从这里导入表，保证单一真源。
+ *
+ * 注意：技能 / 共享技能 / 智能体预设 / 授权都走统一应用模型
+ * （apps + app_releases + app_grants，迁移 0053/0055），没有独立的 skills 表。
  */
 export * from './users';
 export * from './groups';
 export * from './providers';
 export * from './usage';
 export * from './balance';
-export * from './skills';
-export * from './shared';
+export * from './apps';
 export * from './connectors';
 export * from './capabilities';
 export * from './reports';
@@ -26,13 +28,7 @@ import {
   balanceGrantItems,
   balanceGrants,
 } from './balance';
-import { skills, skillGrants } from './skills';
-import {
-  sharedSkills,
-  sharedSkillGrants,
-  agentPresets,
-  agentPresetGrants,
-} from './shared';
+import { apps, appReleases, appGrants } from './apps';
 import { connectors } from './connectors';
 import { capabilityLocks, modelConcurrencyStats } from './capabilities';
 import { reportSubscriptions } from './reports';
@@ -57,12 +53,9 @@ export const schema = {
   balanceLedger,
   balanceGrantItems,
   balanceGrants,
-  skills,
-  skillGrants,
-  sharedSkills,
-  sharedSkillGrants,
-  agentPresets,
-  agentPresetGrants,
+  apps,
+  appReleases,
+  appGrants,
   connectors,
   capabilityLocks,
   modelConcurrencyStats,

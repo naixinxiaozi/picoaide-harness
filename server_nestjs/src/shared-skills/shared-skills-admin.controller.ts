@@ -9,11 +9,14 @@ import {
   Post,
   Put,
   Query,
+  Res,
   UseGuards,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { CurrentAdmin, Permissions, type AdminPrincipal } from '../common/decorators';
 import { AdminAuthGuard } from '../common/guards/admin-auth.guard';
 import { RbacGuard } from '../common/guards/rbac.guard';
+import { writeArchiveResponse } from './archive-response';
 import { SharedSkillsService } from './shared-skills.service';
 
 /** 管理面共享技能审核（/api/server/admin/shared-skills，capability:read/write，channel=org）。 */
@@ -31,8 +34,13 @@ export class SharedSkillsAdminController {
 
   @Get(':name/:version/archive')
   @Permissions('capability:read')
-  archive(@Param('name') name: string, @Param('version') version: string) {
-    return this.svc.download(name, version);
+  async archive(
+    @Param('name') name: string,
+    @Param('version') version: string,
+    @Res() res: Response,
+  ): Promise<void> {
+    const payload = await this.svc.download(name, version);
+    writeArchiveResponse(res, payload, 'X-Skill-Version', 'X-Skill-Checksum');
   }
 
   @Get(':name/:version/preview')

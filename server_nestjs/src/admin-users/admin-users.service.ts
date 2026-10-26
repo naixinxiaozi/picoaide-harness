@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { asc, desc, eq, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, sql } from 'drizzle-orm';
 
 import { AuditService } from '../audit/audit.service';
 import { CryptoService } from '../common/crypto/crypto.service';
@@ -328,13 +328,7 @@ export class AdminUsersService {
       await tx.delete(userGroups).where(eq(userGroups.userId, id));
 
       await tx.execute(
-        sql`DELETE FROM skill_grants WHERE grantee_type = 'user' AND lower(grantee) = lower(${target.username})`,
-      );
-      await tx.execute(
-        sql`DELETE FROM shared_skill_grants WHERE grantee_type = 'user' AND lower(grantee) = lower(${target.username})`,
-      );
-      await tx.execute(
-        sql`DELETE FROM agent_preset_grants WHERE grantee_type = 'user' AND lower(grantee) = lower(${target.username})`,
+        sql`DELETE FROM app_grants WHERE grantee_type = 'user' AND lower(grantee) = lower(${target.username})`,
       );
       await tx.execute(sql`UPDATE groups SET leader_id = 0 WHERE leader_id = ${id}`);
 
@@ -549,15 +543,14 @@ export class AdminUsersService {
   private async groupsBatch(ids: number[]): Promise<Map<number, string[]>> {
     const map = new Map<number, string[]>();
     if (ids.length === 0) return map;
-    const rows = await this.db.execute<{ user_id: string; name: string }>(sql`
-      SELECT ug.user_id, g.name
-      FROM user_groups ug
-      JOIN groups g ON g.id = ug.group_id
-      WHERE ug.user_id = ANY(${ids}::bigint[])
-      ORDER BY g.name
-    `);
+    const rows = await this.db
+      .select({ userId: userGroups.userId, name: groups.name })
+      .from(userGroups)
+      .innerJoin(groups, eq(groups.id, userGroups.groupId))
+      .where(inArray(userGroups.userId, ids))
+      .orderBy(asc(groups.name));
     for (const r of rows) {
-      const uid = Number(r.user_id);
+      const uid = Number(r.userId);
       const arr = map.get(uid) ?? [];
       arr.push(r.name);
       map.set(uid, arr);
@@ -571,15 +564,16 @@ export class AdminUsersService {
     const now = new Date();
     const parts = beijingParts(now);
     const monthStart = beijingMonthStartUTC(parts.year, parts.month);
-    const rows = await this.db.execute<{ user_id: string; total: string }>(sql`
-      SELECT user_id,
-        (COALESCE(SUM(prompt_tokens),0) + COALESCE(SUM(completion_tokens),0))::bigint AS total
-      FROM usage
-      WHERE created_at >= ${monthStart} AND user_id = ANY(${ids}::bigint[])
-      GROUP BY user_id
-    `);
+    const rows = await this.db
+      .select({
+        userId: usage.userId,
+        total: sql<string>`COALESCE(SUM(${usage.promptTokens}),0) + COALESCE(SUM(${usage.completionTokens}),0)`,
+      })
+      .from(usage)
+      .where(and(gte(usage.createdAt, monthStart), inArray(usage.userId, ids)))
+      .groupBy(usage.userId);
     for (const r of rows) {
-      map.set(Number(r.user_id), Number(r.total));
+      map.set(Number(r.userId), Number(r.total));
     }
     return map;
   }
@@ -590,14 +584,16 @@ export class AdminUsersService {
     const now = new Date();
     const parts = beijingParts(now);
     const monthStart = beijingMonthStartUTC(parts.year, parts.month);
-    const rows = await this.db.execute<{ user_id: string; total: number }>(sql`
-      SELECT user_id, COALESCE(SUM(cost),0)::float8 AS total
-      FROM usage
-      WHERE created_at >= ${monthStart} AND user_id = ANY(${ids}::bigint[])
-      GROUP BY user_id
-    `);
+    const rows = await this.db
+      .select({
+        userId: usage.userId,
+        total: sql<string>`COALESCE(SUM(${usage.cost}),0)`,
+      })
+      .from(usage)
+      .where(and(gte(usage.createdAt, monthStart), inArray(usage.userId, ids)))
+      .groupBy(usage.userId);
     for (const r of rows) {
-      map.set(Number(r.user_id), Number(r.total));
+      map.set(Number(r.userId), Number(r.total));
     }
     return map;
   }

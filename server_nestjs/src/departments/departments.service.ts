@@ -1,14 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/database.module';
-import {
-  agentPresetGrants,
-  groups,
-  sharedSkillGrants,
-  skillGrants,
-  userGroups,
-  users,
-} from '../db/schema';
+import { appGrants, groups, userGroups, users } from '../db/schema';
 import { ApiError } from '../common/errors/api-error';
 import { AuditService } from '../audit/audit.service';
 
@@ -70,9 +63,8 @@ export class DepartmentsService {
         (SELECT COUNT(*)::int FROM user_groups ug WHERE ug.group_id = g.id) AS member_count,
         (SELECT COUNT(*)::int FROM groups c WHERE c.parent_id = g.id) AS child_count,
         (
-          (SELECT COUNT(*)::int FROM skill_grants sg WHERE sg.grantee_type = 'group' AND LOWER(sg.grantee) = LOWER(g.name))
-          + (SELECT COUNT(*)::int FROM shared_skill_grants sg WHERE sg.grantee_type = 'group' AND LOWER(sg.grantee) = LOWER(g.name))
-          + (SELECT COUNT(*)::int FROM agent_preset_grants ag WHERE ag.grantee_type = 'group' AND LOWER(ag.grantee) = LOWER(g.name))
+          SELECT COUNT(*)::int FROM app_grants ag
+          WHERE ag.grantee_type = 'group' AND LOWER(ag.grantee) = LOWER(g.name)
         ) AS granted_count
       FROM groups g
       LEFT JOIN users u ON u.id = g.leader_id
@@ -144,6 +136,8 @@ export class DepartmentsService {
 
       await this.audit.log(actor, 'dept_create', `name=${name}`);
       return { id: inserted[0].id, name };
+    }).catch((e: unknown) => {
+      throw mapUniqueViolation(e);
     });
   }
 
@@ -205,11 +199,9 @@ export class DepartmentsService {
         .set({ name, parentId, leaderId, description })
         .where(eq(groups.id, id));
 
-      // Cascade group renames across the three grant tables (mirrors Go app_grants rename).
+      // Cascade group renames across the unified grant table (mirrors Go app_grants rename).
       if (name !== old.name) {
-        await tx.execute(sql`UPDATE skill_grants SET grantee = ${name} WHERE grantee_type = 'group' AND LOWER(grantee) = LOWER(${old.name})`);
-        await tx.execute(sql`UPDATE shared_skill_grants SET grantee = ${name} WHERE grantee_type = 'group' AND LOWER(grantee) = LOWER(${old.name})`);
-        await tx.execute(sql`UPDATE agent_preset_grants SET grantee = ${name} WHERE grantee_type = 'group' AND LOWER(grantee) = LOWER(${old.name})`);
+        await tx.execute(sql`UPDATE app_grants SET grantee = ${name} WHERE grantee_type = 'group' AND LOWER(grantee) = LOWER(${old.name})`);
       }
 
       await this.audit.log(
@@ -218,6 +210,8 @@ export class DepartmentsService {
         `${old.name}→${name} parent:${old.parentId}→${parentId} leader:${old.leaderId}→${leaderId}`,
       );
       return { id, name };
+    }).catch((e: unknown) => {
+      throw mapUniqueViolation(e);
     });
   }
 
@@ -243,10 +237,8 @@ export class DepartmentsService {
       );
       const grantCount = Number(
         (await tx.execute<{ c: number }>(sql`
-          SELECT
-            (SELECT COUNT(*)::int FROM skill_grants WHERE grantee_type = 'group' AND LOWER(grantee) = LOWER(${g.name}))
-            + (SELECT COUNT(*)::int FROM shared_skill_grants WHERE grantee_type = 'group' AND LOWER(grantee) = LOWER(${g.name}))
-            + (SELECT COUNT(*)::int FROM agent_preset_grants WHERE grantee_type = 'group' AND LOWER(grantee) = LOWER(${g.name})) AS c
+          SELECT COUNT(*)::int AS c FROM app_grants
+          WHERE grantee_type = 'group' AND LOWER(grantee) = LOWER(${g.name})
         `))[0].c,
       );
 
@@ -288,4 +280,11 @@ export class DepartmentsService {
     }
     return result;
   }
+}
+
+/** 唯一索引冲突（PG 23505）→ 400 部门名称已存在；其余原样抛出。 */
+function mapUniqueViolation(e: unknown): unknown {
+  const code = (e as { code?: string } | null)?.code;
+  if (code === '23505') return new ApiError('VALIDATION', '部门名称已存在', 400);
+  return e;
 }

@@ -1,29 +1,62 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, desc, eq, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { DRIZZLE, type Database } from '../db/database.module';
 import {
-  agentPresetGrants,
-  agentPresets,
+  appReleases,
   groups,
-  sharedSkills,
-  skillGrants,
-  skills,
-  type AgentPreset,
-  type Skill,
+  users,
+  type App,
+  type AppKind,
+  type GranteeType,
 } from '../db/schema';
-import { ApiError } from '../common/errors/api-error';
+import {
+  CHANNEL_MARKET,
+  STATUS_APPROVED,
+  accessibleAppIds,
+  appDistribution,
+  compareVersions,
+  createRelease,
+  delivered,
+  distributionOf,
+  distributionStates,
+  getApp,
+  getRelease,
+  grantApp,
+  incrementReleaseDownload,
+  listAppGrants,
+  listApps,
+  ownedBy,
+  replaceGroupGrants,
+  revokeApp,
+  setAppEnabled,
+  upsertApp,
+  writable,
+} from '../common/apps-shared';
+import { ApiError, type ErrorCode } from '../common/errors/api-error';
 import { AuditService } from '../audit/audit.service';
 import { CryptoService } from '../common/crypto/crypto.service';
+import { resolveUserEffectiveGroups } from '../common/effective-groups';
 import { rfc3339UTC } from '../common/time';
-import {
-  granteeMatch,
-  isAppId,
-  isVersion,
-  normalizeGrantee,
-  resolveUserGroupNames,
-} from '../common/skills-shared';
+import { isAppId, isVersion, normalizeGrantee } from '../common/skills-shared';
 
-/** 商城技能 JSON（snake_case，与 Go skillJSON 逐字段对齐；无 downloads/calls/official 列 → 默认）。 */
+/**
+ * 技能 / 市场智能体服务（统一应用模型：apps + app_releases + app_grants）。
+ *
+ * 语义权威：server/internal/serverstore/{apps,skills,agent_presets,grants,
+ * distribution}.go 与 server/internal/marketplace/{handlers,skill_api,
+ * agent_api,admin}.go。旧表（skills / shared_skills / agent_presets /
+ * skill_grants / agent_preset_grants）已在迁移 0055 删除。
+ *
+ * 口径摘要：
+ * - 技能商城 = kind='skill' 且 channel='market'；市场智能体 = kind='agent'
+ *   且 channel='market'（组织共享库是 channel='org'，同名跨通道互斥）。
+ * - 「展示版本」= 最高 approved 且未软删的 release（Go currentRelease）；
+ *   创建 App 本身不产生版本，版本只由归档上传产生（不可变快照）。
+ * - 员工面可见性 = 已上架未删 ∧（管理员 ∨ 归属人 ∨ user/部门授权），
+ *   不满足一律 404（不泄露存在性），且授权判定先于下架判定。
+ */
+
+/** 商城技能 JSON（snake_case，与 Go skillJSON 逐字段对齐）。 */
 export interface SkillJSON {
   id: number;
   name: string;
@@ -39,7 +72,7 @@ export interface SkillJSON {
   updated_at: string;
 }
 
-/** 商城智能体 JSON（市场通道，无 enabled/official 列 → 默认）。 */
+/** 商城智能体 JSON（市场通道，与 Go agentJSON 逐字段对齐）。 */
 export interface AgentJSON {
   name: string;
   title: string;
@@ -60,8 +93,38 @@ export interface GrantJSON {
   grantee: string;
 }
 
+/** 归档字节流（控制器负责写头 + 写体）。 */
+export interface ArchivePayload {
+  archive: Buffer;
+  version: string;
+  checksum: string;
+  filename: string;
+  contentType: string;
+}
+
+/** 展示版本所需列（不取 archive，避免列表路径把 bytea 全读出来）。 */
+interface ShownRelease {
+  id: number;
+  version: string;
+  title: string;
+  description: string;
+  changelog: string;
+  quality: string;
+  checksum: string;
+  downloads: number;
+  calls: number;
+}
+
 const MAX_ARCHIVE_BYTES = 16 * 1024 * 1024; // 16 MiB
-const MAX_REASON_LEN = 500;
+
+const KIND_LABEL: Record<AppKind, string> = { skill: '技能', agent: '智能体' };
+
+/**
+ * Go 契约错误码 VERSION_EXISTS（同名同版本冲突）。
+ * shared ERROR_CODES 目前未登记该码，而本文件范围不允许扩公共枚举，
+ * 故在此显式桥接；登记进 common/errors 后可直接替换为字面量。
+ */
+const ERR_VERSION_EXISTS = 'VERSION_EXISTS' as unknown as ErrorCode;
 
 @Injectable()
 export class MarketplaceService {
@@ -73,37 +136,39 @@ export class MarketplaceService {
 
   // ------------------------------------------------------------------ helpers
 
-  private toSkillJSON(s: Skill): SkillJSON {
+  /** 技能投影：App 层优先，版本字段取展示版本（Go appToSkill）。 */
+  private toSkillJSON(a: App, r: ShownRelease | null): SkillJSON {
     return {
-      id: s.id,
-      name: s.name,
-      version: s.version,
-      description: s.description,
-      author: s.author,
-      checksum: s.checksum,
-      enabled: s.enabled === 1,
-      downloads: 0,
-      calls: 0,
-      official: false,
-      created_at: rfc3339UTC(s.createdAt),
-      updated_at: rfc3339UTC(s.updatedAt),
+      id: r?.id ?? 0,
+      name: a.appId,
+      version: r?.version ?? '',
+      description: a.description || (r?.description ?? ''),
+      author: a.owner,
+      checksum: r?.checksum ?? '',
+      enabled: a.enabled === 1,
+      downloads: r?.downloads ?? 0,
+      calls: r?.calls ?? 0,
+      official: a.official === 1,
+      created_at: rfc3339UTC(a.createdAt),
+      updated_at: rfc3339UTC(a.updatedAt),
     };
   }
 
-  private toAgentJSON(p: AgentPreset): AgentJSON {
+  /** 智能体投影（Go agentJSON）：无展示版本时版本相关字段为空。 */
+  private toAgentJSON(a: App, r: ShownRelease | null): AgentJSON {
     return {
-      name: p.name,
-      title: p.displayName,
-      description: p.description,
-      author: p.author,
-      enabled: true,
-      official: false,
-      created_at: rfc3339UTC(p.createdAt),
-      updated_at: rfc3339UTC(p.updatedAt),
-      version: p.version,
-      quality: '',
-      downloads: 0,
-      changelog: '',
+      name: a.appId,
+      title: a.title,
+      description: a.description,
+      author: a.owner,
+      enabled: a.enabled === 1,
+      official: a.official === 1,
+      created_at: rfc3339UTC(a.createdAt),
+      updated_at: rfc3339UTC(a.updatedAt),
+      version: r?.version ?? '',
+      quality: r?.quality ?? '',
+      downloads: r?.downloads ?? 0,
+      changelog: r?.changelog ?? '',
     };
   }
 
@@ -112,8 +177,73 @@ export class MarketplaceService {
     return role === 'super_admin' || role === 'auditor';
   }
 
-  /** 解码 + 校验归档 base64，返回 sha256 校验和。 */
-  private decodeArchive(archive: unknown): string {
+  /**
+   * 某 kind 的展示版本集合：未软删 + approved，每个 appId 取最高版本。
+   * 只选投影需要的列（archive 是 bytea，列表路径绝不能顺带读出来）。
+   */
+  private async shownReleases(
+    kind: AppKind,
+    appId?: string,
+  ): Promise<Map<string, ShownRelease>> {
+    const where = appId
+      ? and(eq(appReleases.kind, kind), eq(appReleases.appId, appId))
+      : eq(appReleases.kind, kind);
+    const rows = await this.db
+      .select({
+        id: appReleases.id,
+        appId: appReleases.appId,
+        version: appReleases.version,
+        title: appReleases.title,
+        description: appReleases.description,
+        changelog: appReleases.changelog,
+        quality: appReleases.quality,
+        checksum: appReleases.checksum,
+        downloads: appReleases.downloads,
+        calls: appReleases.calls,
+        status: appReleases.status,
+        deletedAt: appReleases.deletedAt,
+      })
+      .from(appReleases)
+      .where(where);
+    const out = new Map<string, ShownRelease>();
+    for (const r of rows) {
+      if (r.deletedAt || r.status !== STATUS_APPROVED) continue;
+      const cur = out.get(r.appId);
+      if (!cur || compareVersions(r.version, cur.version) > 0) {
+        out.set(r.appId, {
+          id: r.id,
+          version: r.version,
+          title: r.title,
+          description: r.description,
+          changelog: r.changelog,
+          quality: r.quality,
+          checksum: r.checksum,
+          downloads: r.downloads,
+          calls: r.calls,
+        });
+      }
+    }
+    return out;
+  }
+
+  private async shownRelease(
+    kind: AppKind,
+    appId: string,
+  ): Promise<ShownRelease | null> {
+    return (await this.shownReleases(kind, appId)).get(appId) ?? null;
+  }
+
+  /** 市场通道 App 守卫（不存在 / 非 market 均按「不存在」处理，不泄露跨通道行）。 */
+  private async ensureMarketApp(kind: AppKind, appId: string): Promise<App> {
+    const app = await getApp(this.db, kind, appId);
+    if (!app || app.channel !== CHANNEL_MARKET) {
+      throw new ApiError('NOT_FOUND', `${KIND_LABEL[kind]}不存在`);
+    }
+    return app;
+  }
+
+  /** 解码 + 校验归档 base64，返回原始字节与 sha256。 */
+  private decodeArchive(archive: unknown): { buf: Buffer; checksum: string } {
     if (typeof archive !== 'string' || archive.length === 0) {
       throw new ApiError('VALIDATION', '归档编码错误或为空', 400);
     }
@@ -131,74 +261,251 @@ export class MarketplaceService {
     if (buf.length > MAX_ARCHIVE_BYTES) {
       throw new ApiError('PAYLOAD_TOO_LARGE', '归档过大(上限 16MB)');
     }
-    return this.crypto.sha256(buf.toString('binary'));
+    return { buf, checksum: this.crypto.sha256(buf.toString('binary')) };
+  }
+
+  /** 归档类型按魔数嗅探（Go serveSkillArchive 口径）。 */
+  private archiveKind(buf: Buffer): { contentType: string; ext: string } {
+    if (buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b) {
+      return { contentType: 'application/gzip', ext: '.tar.gz' };
+    }
+    return { contentType: 'application/zip', ext: '.zip' };
+  }
+
+  /** 版本冲突错误（先查 + 唯一约束兜底）。 */
+  private versionExists(version: string): ApiError {
+    return new ApiError(
+      ERR_VERSION_EXISTS,
+      `版本 ${version} 已存在(每个版本都是不可修改的快照),请升版本号后重试`,
+      409,
+    );
+  }
+
+  private isUniqueViolation(err: unknown): boolean {
+    return (
+      typeof err === 'object' &&
+      err !== null &&
+      (err as { code?: unknown }).code === '23505'
+    );
+  }
+
+  /**
+   * 发布一个版本（不可变快照，管理员上架 = 已审核 ⇒ status=approved）。
+   * 同名同版本（含历史被拒/软删占位）一律冲突。
+   */
+  private async publishRelease(
+    kind: AppKind,
+    app: App,
+    version: string,
+    buf: Buffer,
+    checksum: string,
+    publisher: string,
+  ): Promise<void> {
+    if (await getRelease(this.db, kind, app.appId, version)) {
+      throw this.versionExists(version);
+    }
+    const dist = await appDistribution(this.db, kind, app.appId);
+    if (!writable(dist)) {
+      throw new ApiError(
+        'APP_DELISTED',
+        `该${KIND_LABEL[kind]}已下架，暂不能发布新版本：请先联系管理员重新上架`,
+        409,
+      );
+    }
+    try {
+      await createRelease(this.db, {
+        kind,
+        appId: app.appId,
+        version,
+        title: app.title,
+        description: app.description,
+        author: app.owner,
+        publisher,
+        checksum,
+        archive: buf,
+        status: STATUS_APPROVED,
+      });
+    } catch (err) {
+      if (this.isUniqueViolation(err)) throw this.versionExists(version);
+      throw err;
+    }
+  }
+
+  private parseGrantSubject(body: {
+    username?: string;
+    group?: string;
+  }): { subject: string; granteeType: GranteeType } {
+    const username = (body?.username ?? '').trim();
+    const group = (body?.group ?? '').trim();
+    if (!!username === !!group) {
+      throw new ApiError('VALIDATION', 'username 或 group 必填且只能二选一', 400);
+    }
+    const subject = normalizeGrantee(username || group);
+    if (!subject) throw new ApiError('VALIDATION', '授权对象不合法', 400);
+    return { subject, granteeType: username ? 'user' : 'group' };
+  }
+
+  /** 授权主体大小写不敏感解析：返回库内规范写法（拼错的名字不静默落库）。 */
+  private async canonicalGrantee(
+    subject: string,
+    granteeType: GranteeType,
+  ): Promise<string> {
+    if (granteeType === 'user') {
+      const [row] = await this.db
+        .select({ username: users.username })
+        .from(users)
+        .where(sql`lower(${users.username}) = ${subject.toLowerCase()}`)
+        .limit(1);
+      if (!row) {
+        throw new ApiError('VALIDATION', `用户不存在: ${subject}`, 400);
+      }
+      return row.username;
+    }
+    const canonical = await this.canonicalGroup(subject);
+    if (!canonical) {
+      throw new ApiError('VALIDATION', `部门不存在: ${subject}`, 400);
+    }
+    return canonical;
+  }
+
+  /** 部门名大小写不敏感解析（返回库内规范写法；不存在 → null）。 */
+  private async canonicalGroup(name: string): Promise<string | null> {
+    const [row] = await this.db
+      .select({ name: groups.name })
+      .from(groups)
+      .where(sql`lower(${groups.name}) = ${name.toLowerCase()}`)
+      .limit(1);
+    return row?.name ?? null;
+  }
+
+  /** 单条授权 / 撤销（market App 守卫 + 主体校验 + 审计）。 */
+  private async applyGrant(
+    kind: AppKind,
+    appId: string,
+    body: { username?: string; group?: string },
+    actor: string,
+    grant: boolean,
+  ): Promise<void> {
+    await this.ensureMarketApp(kind, appId);
+    const { subject, granteeType } = this.parseGrantSubject(body);
+    const canonical = await this.canonicalGrantee(subject, granteeType);
+    const ok = grant
+      ? await grantApp(this.db, kind, appId, canonical, granteeType)
+      : await revokeApp(this.db, kind, appId, canonical, granteeType);
+    if (!ok) throw new ApiError('VALIDATION', '授权对象不合法', 400);
+    await this.audit.log(
+      actor,
+      `${kind}_${grant ? 'grant' : 'revoke'}`,
+      `${appId}:${granteeType}:${canonical}`,
+    );
+  }
+
+  /** 整组替换部门授权（用户授权保留；Go ReplaceSkillGroupGrants 口径）。 */
+  private async replaceGroups(
+    kind: AppKind,
+    appId: string,
+    rawGroups: unknown,
+    actor: string,
+  ): Promise<void> {
+    await this.ensureMarketApp(kind, appId);
+    if (!Array.isArray(rawGroups)) {
+      throw new ApiError('VALIDATION', '请求体错误(仅接受 groups 字段)', 400);
+    }
+    const cleaned: string[] = [];
+    for (const raw of rawGroups.map(String)) {
+      const g = normalizeGrantee(raw);
+      if (!g) throw new ApiError('VALIDATION', '部门名不合法或不存在', 400);
+      const canonical = await this.canonicalGroup(g);
+      if (!canonical) {
+        throw new ApiError('VALIDATION', '存在不认识的部门名称', 400);
+      }
+      if (!cleaned.includes(canonical)) cleaned.push(canonical);
+    }
+    const result = await replaceGroupGrants(
+      this.db,
+      kind,
+      appId,
+      cleaned,
+      async () => true,
+    );
+    if (result !== 'ok') {
+      throw new ApiError('VALIDATION', '存在不认识的部门名称', 400);
+    }
+    await this.audit.log(
+      actor,
+      `${kind}_grants`,
+      cleaned.length ? `${appId} ${cleaned.join(',')}` : appId,
+    );
   }
 
   // ------------------------------------------------------------ skills (market)
 
   /** 管理面：全量商城技能（含下架）。 */
   async listSkills(): Promise<SkillJSON[]> {
-    const rows = await this.db.select().from(skills).orderBy(skills.name);
-    return rows.map((s) => this.toSkillJSON(s));
+    const [apps, shown] = await Promise.all([
+      listApps(this.db, 'skill', CHANNEL_MARKET),
+      this.shownReleases('skill'),
+    ]);
+    return apps.map((a) => this.toSkillJSON(a, shown.get(a.appId) ?? null));
   }
 
-  /** 员工面：enabled + 授权（admin 全量）。 */
+  /**
+   * 员工面：已上架技能 + 授权（管理员全量；否则授权 ∪ 归属人）。
+   * 授权判定用有效部门（含祖先/主管子树/全员组）。
+   */
   async listMarketSkillsForEmployee(
     username: string,
     role: string,
     userId: number,
   ): Promise<SkillJSON[]> {
-    const rows = await this.db
-      .select()
-      .from(skills)
-      .where(eq(skills.enabled, 1))
-      .orderBy(skills.name);
-    if (this.adminFull(role)) return rows.map((s) => this.toSkillJSON(s));
+    const [apps, states, shown] = await Promise.all([
+      listApps(this.db, 'skill', CHANNEL_MARKET),
+      distributionStates(this.db, 'skill'),
+      this.shownReleases('skill'),
+    ]);
+    const onShelf = apps.filter((a) =>
+      delivered(distributionOf(states, a.appId)),
+    );
+    const project = (rows: App[]): SkillJSON[] =>
+      rows.map((a) => this.toSkillJSON(a, shown.get(a.appId) ?? null));
+    if (this.adminFull(role)) return project(onShelf);
 
-    const groups = await resolveUserGroupNames(this.db, userId);
-    const granted = await this.db
-      .selectDistinct({ name: skillGrants.skillName })
-      .from(skillGrants)
-      .where(granteeMatch(username, groups));
-    const grantedSet = new Set(granted.map((g) => g.name));
-    return rows
-      .filter((s) => grantedSet.has(s.name))
-      .map((s) => this.toSkillJSON(s));
+    const groups = await resolveUserEffectiveGroups(this.db, userId);
+    const granted = await accessibleAppIds(this.db, 'skill', username, groups);
+    const allowed = new Set(granted);
+    return project(
+      onShelf.filter(
+        (a) =>
+          allowed.has(a.appId) ||
+          ownedBy(distributionOf(states, a.appId), username),
+      ),
+    );
   }
 
-  /** 员工面：单个技能，授权先于下架判定（未授权 404 不泄露存在性）。 */
+  /** 员工面：单个技能；授权先于下架（未授权 404，不泄露存在性）。 */
   async getMarketSkill(
     name: string,
     username: string,
     role: string,
     userId: number,
   ): Promise<SkillJSON> {
-    const [s] = await this.db
-      .select()
-      .from(skills)
-      .where(eq(skills.name, name))
-      .limit(1);
-    if (!s) throw new ApiError('NOT_FOUND', '技能不存在');
-
-    if (!this.adminFull(role)) {
-      const groups = await resolveUserGroupNames(this.db, userId);
-      const [g] = await this.db
-        .select()
-        .from(skillGrants)
-        .where(
-          and(
-            eq(skillGrants.skillName, name),
-            granteeMatch(username, groups),
-          ),
-        )
-        .limit(1);
-      if (!g) throw new ApiError('NOT_FOUND', '技能不存在');
+    const app = await getApp(this.db, 'skill', name);
+    if (!app || app.channel !== CHANNEL_MARKET) {
+      throw new ApiError('NOT_FOUND', '技能不存在');
     }
-    if (s.enabled !== 1) throw new ApiError('NOT_FOUND', '技能已下架');
-    return this.toSkillJSON(s);
+    const dist = await appDistribution(this.db, 'skill', name);
+    if (!this.adminFull(role)) {
+      const groups = await resolveUserEffectiveGroups(this.db, userId);
+      const granted = await accessibleAppIds(this.db, 'skill', username, groups);
+      if (!granted.includes(name) && !ownedBy(dist, username)) {
+        throw new ApiError('NOT_FOUND', '技能不存在');
+      }
+    }
+    if (!delivered(dist)) throw new ApiError('NOT_FOUND', '技能已下架');
+    return this.toSkillJSON(app, await this.shownRelease('skill', name));
   }
 
-  /** 管理面：创建商城技能。 */
+  /** 管理面：创建商城技能（只登记 App 身份，版本由归档上传产生）。 */
   async createSkill(body: {
     name?: string;
     version?: string;
@@ -210,107 +517,95 @@ export class MarketplaceService {
     if (!isAppId(name)) {
       throw new ApiError(
         'INVALID_APP_ID',
-        '技能名不合法:必须是小写 kebab-case',
+        '技能名不合法:必须是小写 kebab-case(如 my-skill)',
+        400,
       );
     }
-    // 同名共享技能冲突（跨通道）。
-    const [org] = await this.db
-      .select({ name: sharedSkills.name })
-      .from(sharedSkills)
-      .where(eq(sharedSkills.name, name))
-      .limit(1);
-    if (org) throw new ApiError('CONFLICT', '名称与共享技能冲突');
-    const [dup] = await this.db
-      .select({ name: skills.name })
-      .from(skills)
-      .where(eq(skills.name, name))
-      .limit(1);
-    if (dup) throw new ApiError('VALIDATION', '技能已存在', 400);
-
-    const version = (body?.version ?? '').trim() || '1.0.0';
-    const description = body?.description ?? '';
-    const author = body?.author ?? '';
-    const [row] = await this.db
-      .insert(skills)
-      .values({ name, version, description, author, gitUrl: '' })
-      .returning();
+    const existing = await getApp(this.db, 'skill', name);
+    if (existing) {
+      // 决策 2026-08-25：市场与组织共享库同名互斥。
+      if (existing.channel !== CHANNEL_MARKET) {
+        throw new ApiError(
+          'CONFLICT',
+          '名称与组织共享库技能冲突,请先在共享库处理同名技能',
+          409,
+        );
+      }
+      throw new ApiError('VALIDATION', '技能已存在', 400);
+    }
+    const author = (body?.author ?? '').trim();
+    await upsertApp(this.db, {
+      kind: 'skill',
+      appId: name,
+      title: name,
+      description: body?.description ?? '',
+      owner: author,
+      channel: CHANNEL_MARKET,
+      enabled: 1,
+    });
     await this.audit.log(author || 'admin', 'skill_create', name);
-    return this.toSkillJSON(row);
+    return this.toSkillJSON(await this.ensureMarketApp('skill', name), null);
   }
 
-  /** 管理面：更新技能元信息（不动 owner/author）。 */
+  /** 管理面：更新技能元信息（版本与归属不在这里改）。 */
   async updateSkillMeta(
     name: string,
     body: { name?: string; version?: string; description?: string; author?: string },
   ): Promise<SkillJSON> {
-    const [row] = await this.db
-      .select()
-      .from(skills)
-      .where(eq(skills.name, name))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '技能不存在');
-
-    if (body?.version != null && body.version !== row.version) {
+    const app = await this.ensureMarketApp('skill', name);
+    const shown = await this.shownRelease('skill', name);
+    const currentVersion = shown?.version ?? '';
+    if ((body?.version ?? '') !== '' && body.version !== currentVersion) {
       throw new ApiError(
         'VALIDATION',
         '请用「上传新版」随归档一起更改版本',
         400,
       );
     }
-    if (body?.author != null && body.author !== row.author) {
+    if ((body?.author ?? '') !== '' && body.author !== app.owner) {
       throw new ApiError(
         'VALIDATION',
-        '归属(负责人)不能在这里修改，请使用专门的负责人变更流程',
+        '归属(负责人)不能在这里修改:它决定谁能续传新版本,请用「转移归属」',
         400,
       );
     }
-    const description = body?.description;
-    if (description !== undefined && description !== '') {
-      await this.db
-        .update(skills)
-        .set({ description, updatedAt: new Date() })
-        .where(eq(skills.name, name));
-    }
+    const title = (body?.name ?? '').trim();
+    const description = body?.description ?? '';
+    await upsertApp(this.db, {
+      kind: 'skill',
+      appId: name,
+      title: title || app.title,
+      description: description || app.description,
+      owner: app.owner,
+      channel: CHANNEL_MARKET,
+      enabled: app.enabled,
+    });
     await this.audit.log('admin', 'skill_update', name);
-    const [fresh] = await this.db
-      .select()
-      .from(skills)
-      .where(eq(skills.name, name))
-      .limit(1);
-    return this.toSkillJSON(fresh);
+    return this.toSkillJSON(
+      await this.ensureMarketApp('skill', name),
+      await this.shownRelease('skill', name),
+    );
   }
 
-  /** 管理面：软下架。 */
+  /** 管理面：下架（只挡分发面，不删数据）。 */
   async disableSkill(name: string, username: string): Promise<void> {
-    const [row] = await this.db
-      .select()
-      .from(skills)
-      .where(eq(skills.name, name))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '技能不存在');
-    await this.db
-      .update(skills)
-      .set({ enabled: 0, updatedAt: new Date() })
-      .where(eq(skills.name, name));
+    await this.setSkillEnabled(name, false);
     await this.audit.log(username, 'skill_disable', name);
   }
 
-  /** 管理面：上架。 */
+  /** 管理面：重新上架。 */
   async enableSkill(name: string, username: string): Promise<void> {
-    const [row] = await this.db
-      .select()
-      .from(skills)
-      .where(eq(skills.name, name))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '技能不存在');
-    await this.db
-      .update(skills)
-      .set({ enabled: 1, updatedAt: new Date() })
-      .where(eq(skills.name, name));
+    await this.setSkillEnabled(name, true);
     await this.audit.log(username, 'skill_enable', name);
   }
 
-  /** 管理面：上传新版归档。 */
+  private async setSkillEnabled(name: string, enabled: boolean): Promise<void> {
+    await this.ensureMarketApp('skill', name);
+    const ok = await setAppEnabled(this.db, 'skill', name, enabled);
+    if (!ok) throw new ApiError('NOT_FOUND', '技能不存在');
+  }
+
+  /** 管理面：上传新版归档（版本 = 不可变快照，管理员上传即已审核）。 */
   async uploadSkillArchive(
     name: string,
     body: { version?: string; archive?: unknown },
@@ -321,28 +616,18 @@ export class MarketplaceService {
     if (!version || archive == null) {
       throw new ApiError('VALIDATION', 'version 与 archive 必填', 400);
     }
-    if (version.includes('/') || version.includes('\\')) {
+    if (!isAppId(name)) throw new ApiError('VALIDATION', '技能名不合法', 400);
+    if (version.includes('/') || version.includes('\\') || !isVersion(version)) {
       throw new ApiError('VALIDATION', '版本不合法', 400);
     }
-    if (!isVersion(version)) {
-      throw new ApiError('VALIDATION', '版本不合法', 400);
-    }
-    const checksum = this.decodeArchive(archive);
-    const [row] = await this.db
-      .select()
-      .from(skills)
-      .where(eq(skills.name, name))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '技能不存在');
-    await this.db
-      .update(skills)
-      .set({ version, checksum, updatedAt: new Date() })
-      .where(eq(skills.name, name));
+    const { buf, checksum } = this.decodeArchive(archive);
+    const app = await this.ensureMarketApp('skill', name);
+    await this.publishRelease('skill', app, version, buf, checksum, username);
     await this.audit.log(username, 'skill_update', `${name}@${version}`);
     return { version, checksum };
   }
 
-  /** 管理面：技能预览（无归档字节 → 空文件清单结构）。 */
+  /** 管理面：技能预览（服务端不解析归档 → 空文件清单结构）。 */
   async previewSkill(name: string): Promise<{
     files: unknown[];
     skill_md: string;
@@ -350,63 +635,61 @@ export class MarketplaceService {
     version: string;
     checksum: string;
   }> {
-    const [row] = await this.db
-      .select()
-      .from(skills)
-      .where(eq(skills.name, name))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '技能不存在');
+    const app = await this.ensureMarketApp('skill', name);
+    const shown = await this.shownRelease('skill', name);
     return {
       files: [],
       skill_md: '',
-      name: row.name,
-      version: row.version,
-      checksum: row.checksum,
+      name: app.appId,
+      version: shown?.version ?? '',
+      checksum: shown?.checksum ?? '',
     };
   }
 
-  /** 管理面：技能归档内文件读取（无归档字节 → 结构）。 */
+  /** 管理面：技能归档内文件读取（无归档解析器 → 空内容结构）。 */
   async skillFile(
     name: string,
     path: string,
   ): Promise<{ path: string; size: number; binary: boolean; too_large: boolean; content: string }> {
-    const [row] = await this.db
-      .select()
-      .from(skills)
-      .where(eq(skills.name, name))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '技能不存在');
+    await this.ensureMarketApp('skill', name);
     const p = (path ?? '').replace(/\\/g, '/').replace(/^\/+/, '');
     return { path: p, size: 0, binary: false, too_large: false, content: '' };
   }
 
-  /** 员工/管理面：归档下载（重写版不落盘归档字节，返回 404 结构）。 */
-  async downloadSkillArchive(name: string): Promise<void> {
-    const [row] = await this.db
-      .select()
-      .from(skills)
-      .where(eq(skills.name, name))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '技能不存在');
-    throw new ApiError('NOT_FOUND', '归档文件未存储');
+  /** 管理面：下载当前展示版本归档（不过分发闸门）。 */
+  async downloadSkillArchive(name: string): Promise<ArchivePayload> {
+    await this.ensureMarketApp('skill', name);
+    const shown = await this.shownRelease('skill', name);
+    if (!shown) throw new ApiError('NOT_FOUND', '技能尚未上传归档');
+    const release = await getRelease(this.db, 'skill', name, shown.version);
+    if (!release?.archive || release.archive.length === 0) {
+      throw new ApiError('NOT_FOUND', '技能尚未上传归档');
+    }
+    const { contentType, ext } = this.archiveKind(release.archive);
+    await incrementReleaseDownload(this.db, 'skill', name, shown.version);
+    return {
+      archive: release.archive,
+      version: shown.version,
+      checksum:
+        release.checksum ||
+        this.crypto.sha256(release.archive.toString('binary')),
+      filename: `${name}-${shown.version}${ext}`,
+      contentType,
+    };
   }
 
-  /** 管理面：规范化（无文件内容 → 已合规结构）。 */
+  /** 管理面：规范化（服务端不改写归档 → 已合规结构）。 */
   async normalizeSkill(name: string): Promise<{
     version: string;
     checksum: string;
     changes: unknown[];
     already_compliant: boolean;
   }> {
-    const [row] = await this.db
-      .select()
-      .from(skills)
-      .where(eq(skills.name, name))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '技能不存在');
+    await this.ensureMarketApp('skill', name);
+    const shown = await this.shownRelease('skill', name);
     return {
-      version: row.version,
-      checksum: row.checksum,
+      version: shown?.version ?? '',
+      checksum: shown?.checksum ?? '',
       changes: [],
       already_compliant: true,
     };
@@ -415,12 +698,8 @@ export class MarketplaceService {
   // ------------------------------------------------------------ skills grants
 
   async listSkillGrants(name: string): Promise<GrantJSON[]> {
-    const rows = await this.db
-      .select()
-      .from(skillGrants)
-      .where(eq(skillGrants.skillName, name))
-      .orderBy(skillGrants.granteeType, skillGrants.grantee);
-    return rows.map((g) => ({ grantee_type: g.granteeType, grantee: g.grantee }));
+    await this.ensureMarketApp('skill', name);
+    return listAppGrants(this.db, 'skill', name);
   }
 
   async replaceSkillGrants(
@@ -428,29 +707,7 @@ export class MarketplaceService {
     rawGroups: unknown,
     username: string,
   ): Promise<void> {
-    const list = Array.isArray(rawGroups) ? rawGroups.map(String) : [];
-    const cleaned: string[] = [];
-    for (const g of list) {
-      const n = normalizeGrantee(g);
-      if (!n) throw new ApiError('VALIDATION', '部门名不合法或不存在', 400);
-      if (!cleaned.includes(n)) cleaned.push(n);
-    }
-    // 校验每个部门存在（大小写不敏感）。
-    for (const g of cleaned) {
-      const [exists] = await this.db
-        .select({ id: groups.id })
-        .from(groups)
-        .where(sql`lower(${groups.name}) = ${g.toLowerCase()}`)
-        .limit(1);
-      if (!exists) throw new ApiError('VALIDATION', '部门名不合法或不存在', 400);
-    }
-    await this.db.transaction(async (tx) => {
-      await tx.delete(skillGrants).where(and(eq(skillGrants.skillName, name), eq(skillGrants.granteeType, 'group')));
-      for (const g of cleaned) {
-        await tx.insert(skillGrants).values({ skillName: name, granteeType: 'group', grantee: g }).onConflictDoNothing();
-      }
-    });
-    await this.audit.log(username, 'skill_grants_replace', name);
+    await this.replaceGroups('skill', name, rawGroups, username);
   }
 
   async grantSkill(
@@ -458,24 +715,7 @@ export class MarketplaceService {
     body: { username?: string; group?: string },
     username: string,
   ): Promise<void> {
-    const hasUser = body?.username != null && body.username !== '';
-    const raw = hasUser ? body!.username! : (body?.group ?? '');
-    const grantee = normalizeGrantee(raw);
-    if (!grantee) throw new ApiError('VALIDATION', '授权对象不合法', 400);
-    const granteeType = hasUser ? ('user' as const) : ('group' as const);
-    if (granteeType === 'group') {
-      const [exists] = await this.db
-        .select({ id: groups.id })
-        .from(groups)
-        .where(sql`lower(${groups.name}) = ${grantee.toLowerCase()}`)
-        .limit(1);
-      if (!exists) throw new ApiError('VALIDATION', '部门名不合法或不存在', 400);
-    }
-    await this.db
-      .insert(skillGrants)
-      .values({ skillName: name, granteeType, grantee })
-      .onConflictDoNothing();
-    await this.audit.log(username, 'skill_grant', `${name}:${granteeType}:${grantee}`);
+    await this.applyGrant('skill', name, body, username, true);
   }
 
   async revokeSkillGrant(
@@ -483,21 +723,7 @@ export class MarketplaceService {
     body: { username?: string; group?: string },
     username: string,
   ): Promise<void> {
-    const hasUser = body?.username != null && body.username !== '';
-    const raw = hasUser ? body!.username! : (body?.group ?? '');
-    const grantee = normalizeGrantee(raw);
-    if (!grantee) throw new ApiError('VALIDATION', '授权对象不合法', 400);
-    const granteeType = hasUser ? ('user' as const) : ('group' as const);
-    await this.db
-      .delete(skillGrants)
-      .where(
-        and(
-          eq(skillGrants.skillName, name),
-          eq(skillGrants.granteeType, granteeType),
-          eq(skillGrants.grantee, grantee),
-        ),
-      );
-    await this.audit.log(username, 'skill_revoke', `${name}:${granteeType}:${grantee}`);
+    await this.applyGrant('skill', name, body, username, false);
   }
 
   // ------------------------------------------------------------ builtin
@@ -526,17 +752,16 @@ export class MarketplaceService {
 
   // ------------------------------------------------------------ agents (market)
 
-  /** 管理面：全量市场智能体。 */
+  /** 管理面：全量市场智能体（含下架）。 */
   async listAgents(): Promise<AgentJSON[]> {
-    const rows = await this.db
-      .select()
-      .from(agentPresets)
-      .where(eq(agentPresets.status, 'approved'))
-      .orderBy(agentPresets.name, agentPresets.version);
-    return rows.map((p) => this.toAgentJSON(p));
+    const [apps, shown] = await Promise.all([
+      listApps(this.db, 'agent', CHANNEL_MARKET),
+      this.shownReleases('agent'),
+    ]);
+    return apps.map((a) => this.toAgentJSON(a, shown.get(a.appId) ?? null));
   }
 
-  /** 管理面：创建市场智能体（市场通道无审核 → status=approved）。 */
+  /** 管理面：创建市场智能体（只登记 App 身份，版本由归档上传产生）。 */
   async createAgent(
     body: { name?: string; description?: string; author?: string },
     adminUsername: string,
@@ -547,89 +772,74 @@ export class MarketplaceService {
       throw new ApiError(
         'INVALID_APP_ID',
         '名称不合法:必须是小写 kebab-case(如 my-agent)',
+        400,
       );
     }
-    // 跨通道冲突（共享 Agent 预设）。
-    const [org] = await this.db
-      .select({ name: agentPresets.name })
-      .from(agentPresets)
-      .where(and(eq(agentPresets.name, name), sql`${agentPresets.status} <> 'approved'`))
-      .limit(1);
-    if (org) throw new ApiError('CONFLICT', '名称与共享智能体冲突');
-    const [dup] = await this.db
-      .select({ name: agentPresets.name })
-      .from(agentPresets)
-      .where(and(eq(agentPresets.name, name), eq(agentPresets.status, 'approved')))
-      .limit(1);
-    if (dup) throw new ApiError('VALIDATION', '智能体已存在', 400);
-
+    const existing = await getApp(this.db, 'agent', name);
+    if (existing) {
+      if (existing.channel !== CHANNEL_MARKET) {
+        throw new ApiError(
+          'CONFLICT',
+          '名称与组织共享库智能体冲突,请先在共享库处理同名智能体',
+          409,
+        );
+      }
+      throw new ApiError('VALIDATION', '智能体已存在', 400);
+    }
     const author = (body?.author ?? '').trim() || adminUsername;
-    const description = body?.description ?? '';
-    const [row] = await this.db
-      .insert(agentPresets)
-      .values({
-        name,
-        displayName: name,
-        version: '1.0.0',
-        description,
-        author,
-        checksum: '',
-        status: 'approved',
-        reason: '',
-      })
-      .returning();
+    await upsertApp(this.db, {
+      kind: 'agent',
+      appId: name,
+      title: name,
+      description: body?.description ?? '',
+      owner: author,
+      channel: CHANNEL_MARKET,
+      enabled: 1,
+    });
     await this.audit.log(adminUsername, 'agent_create', name);
-    return this.toAgentJSON(row);
+    return this.toAgentJSON(await this.ensureMarketApp('agent', name), null);
   }
 
-  /** 管理面：更新市场智能体元信息（不动 owner）。 */
+  /** 管理面：更新市场智能体元信息（不碰归属）。 */
   async updateAgentMeta(
     name: string,
     body: { name?: string; description?: string; author?: string },
     username: string,
   ): Promise<void> {
-    const [row] = await this.db
-      .select()
-      .from(agentPresets)
-      .where(and(eq(agentPresets.name, name), eq(agentPresets.status, 'approved')))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '智能体不存在');
+    const app = await this.ensureMarketApp('agent', name);
     const title = (body?.name ?? '').trim();
     const description = body?.description ?? '';
-    await this.db
-      .update(agentPresets)
-      .set({
-        ...(title ? { displayName: title } : {}),
-        ...(description ? { description } : {}),
-        updatedAt: new Date(),
-      })
-      .where(eq(agentPresets.id, row.id));
+    await upsertApp(this.db, {
+      kind: 'agent',
+      appId: name,
+      title: title || app.title,
+      description: description || app.description,
+      owner: app.owner,
+      channel: CHANNEL_MARKET,
+      enabled: app.enabled,
+    });
     await this.audit.log(username, 'agent_update_meta', name);
   }
 
-  /** 管理面：软下架市场智能体（无 enabled 列 → 校验存在 + 审计的 no-op）。 */
+  /** 管理面：下架市场智能体。 */
   async disableAgent(name: string, username: string): Promise<void> {
-    const [row] = await this.db
-      .select()
-      .from(agentPresets)
-      .where(and(eq(agentPresets.name, name), eq(agentPresets.status, 'approved')))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '智能体不存在');
+    await this.setAgentEnabled(name, false);
     await this.audit.log(username, 'agent_disable', name);
   }
 
-  /** 管理面：上架市场智能体（no-op）。 */
+  /** 管理面：重新上架市场智能体。 */
   async enableAgent(name: string, username: string): Promise<void> {
-    const [row] = await this.db
-      .select()
-      .from(agentPresets)
-      .where(and(eq(agentPresets.name, name), eq(agentPresets.status, 'approved')))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '智能体不存在');
+    await this.setAgentEnabled(name, true);
     await this.audit.log(username, 'agent_enable', name);
   }
 
-  /** 管理面：上传市场智能体归档（更新版本 + 校验和）。 */
+  private async setAgentEnabled(name: string, enabled: boolean): Promise<void> {
+    await this.ensureMarketApp('agent', name);
+    const ok = await setAppEnabled(this.db, 'agent', name, enabled);
+    if (!ok) throw new ApiError('NOT_FOUND', '智能体不存在');
+  }
+
+  /** 管理面：上传市场智能体归档（管理员上传即已审核）。 */
   async uploadAgentArchive(
     name: string,
     body: { version?: string; archive?: unknown },
@@ -640,74 +850,68 @@ export class MarketplaceService {
     if (!version || archive == null) {
       throw new ApiError('VALIDATION', 'version 与 archive 必填', 400);
     }
-    if (!isVersion(version)) {
+    if (!isAppId(name)) throw new ApiError('VALIDATION', '智能体名不合法', 400);
+    if (version.includes('/') || version.includes('\\') || !isVersion(version)) {
       throw new ApiError('VALIDATION', '版本不合法', 400);
     }
-    const checksum = this.decodeArchive(archive);
-    const [row] = await this.db
-      .select()
-      .from(agentPresets)
-      .where(and(eq(agentPresets.name, name), eq(agentPresets.status, 'approved')))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '智能体不存在');
-    await this.db
-      .update(agentPresets)
-      .set({ version, checksum, updatedAt: new Date() })
-      .where(eq(agentPresets.id, row.id));
+    const { buf, checksum } = this.decodeArchive(archive);
+    const app = await this.ensureMarketApp('agent', name);
+    await this.publishRelease('agent', app, version, buf, checksum, username);
     await this.audit.log(username, 'agent_update', `${name}@${version}`);
     return { version, checksum };
   }
 
-  /** 管理面：市场智能体预览（无归档字节 → 结构）。 */
+  /** 管理面：市场智能体预览。 */
   async previewAgent(name: string): Promise<{
     files: unknown[];
     composition: string;
     version: string;
   }> {
-    const [row] = await this.db
-      .select()
-      .from(agentPresets)
-      .where(and(eq(agentPresets.name, name), eq(agentPresets.status, 'approved')))
-      .orderBy(desc(agentPresets.createdAt))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '智能体尚未发布版本');
-    return { files: [], composition: '', version: row.version };
+    await this.ensureMarketApp('agent', name);
+    const shown = await this.shownRelease('agent', name);
+    if (!shown) throw new ApiError('NOT_FOUND', '智能体尚未发布版本');
+    return { files: [], composition: '', version: shown.version };
   }
 
-  /** 管理面：市场智能体文件读取（结构）。 */
+  /** 管理面：市场智能体文件读取（无归档解析器 → 空内容结构）。 */
   async agentFile(
     name: string,
     path: string,
   ): Promise<{ size: number; content?: string; binary?: boolean; too_large?: boolean }> {
-    const [row] = await this.db
-      .select()
-      .from(agentPresets)
-      .where(and(eq(agentPresets.name, name), eq(agentPresets.status, 'approved')))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '智能体不存在');
+    await this.ensureMarketApp('agent', name);
+    const shown = await this.shownRelease('agent', name);
+    if (!shown) throw new ApiError('NOT_FOUND', '智能体尚未发布版本');
+    // path 仅用于形状对齐；真正的归档解析在 agentshare 域（本服务不落盘）。
     return { size: 0, content: '' };
   }
 
-  /** 员工/管理面：市场智能体归档下载（no-op 404）。 */
-  async downloadAgentArchive(name: string): Promise<void> {
-    const [row] = await this.db
-      .select()
-      .from(agentPresets)
-      .where(and(eq(agentPresets.name, name), eq(agentPresets.status, 'approved')))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '智能体不存在');
-    throw new ApiError('NOT_FOUND', '归档文件未存储');
+  /** 管理面：下载市场智能体当前展示版本归档。 */
+  async downloadAgentArchive(name: string): Promise<ArchivePayload> {
+    await this.ensureMarketApp('agent', name);
+    const shown = await this.shownRelease('agent', name);
+    if (!shown) throw new ApiError('NOT_FOUND', '智能体尚未发布版本');
+    const release = await getRelease(this.db, 'agent', name, shown.version);
+    if (!release?.archive || release.archive.length === 0) {
+      throw new ApiError('NOT_FOUND', '智能体尚未发布版本');
+    }
+    const { contentType, ext } = this.archiveKind(release.archive);
+    await incrementReleaseDownload(this.db, 'agent', name, shown.version);
+    return {
+      archive: release.archive,
+      version: shown.version,
+      checksum:
+        release.checksum ||
+        this.crypto.sha256(release.archive.toString('binary')),
+      filename: `${name}-${shown.version}${ext}`,
+      contentType,
+    };
   }
 
   // ------------------------------------------------------------ agent grants
 
   async listAgentGrants(name: string): Promise<GrantJSON[]> {
-    const rows = await this.db
-      .select()
-      .from(agentPresetGrants)
-      .where(eq(agentPresetGrants.presetName, name))
-      .orderBy(agentPresetGrants.granteeType, agentPresetGrants.grantee);
-    return rows.map((g) => ({ grantee_type: g.granteeType, grantee: g.grantee }));
+    await this.ensureMarketApp('agent', name);
+    return listAppGrants(this.db, 'agent', name);
   }
 
   async replaceAgentGrants(
@@ -715,28 +919,7 @@ export class MarketplaceService {
     rawGroups: unknown,
     username: string,
   ): Promise<void> {
-    const list = Array.isArray(rawGroups) ? rawGroups.map(String) : [];
-    const cleaned: string[] = [];
-    for (const g of list) {
-      const n = normalizeGrantee(g);
-      if (!n) throw new ApiError('VALIDATION', '部门名不合法或不存在', 400);
-      if (!cleaned.includes(n)) cleaned.push(n);
-    }
-    for (const g of cleaned) {
-      const [exists] = await this.db
-        .select({ id: groups.id })
-        .from(groups)
-        .where(sql`lower(${groups.name}) = ${g.toLowerCase()}`)
-        .limit(1);
-      if (!exists) throw new ApiError('VALIDATION', '部门名不合法或不存在', 400);
-    }
-    await this.db.transaction(async (tx) => {
-      await tx.delete(agentPresetGrants).where(and(eq(agentPresetGrants.presetName, name), eq(agentPresetGrants.granteeType, 'group')));
-      for (const g of cleaned) {
-        await tx.insert(agentPresetGrants).values({ presetName: name, granteeType: 'group', grantee: g }).onConflictDoNothing();
-      }
-    });
-    await this.audit.log(username, 'agent_grants', name);
+    await this.replaceGroups('agent', name, rawGroups, username);
   }
 
   async grantAgent(
@@ -744,24 +927,7 @@ export class MarketplaceService {
     body: { username?: string; group?: string },
     username: string,
   ): Promise<void> {
-    const hasUser = body?.username != null && body.username !== '';
-    const raw = hasUser ? body!.username! : (body?.group ?? '');
-    const grantee = normalizeGrantee(raw);
-    if (!grantee) throw new ApiError('VALIDATION', '授权对象不合法', 400);
-    const granteeType = hasUser ? ('user' as const) : ('group' as const);
-    if (granteeType === 'group') {
-      const [exists] = await this.db
-        .select({ id: groups.id })
-        .from(groups)
-        .where(sql`lower(${groups.name}) = ${grantee.toLowerCase()}`)
-        .limit(1);
-      if (!exists) throw new ApiError('VALIDATION', '部门名不合法或不存在', 400);
-    }
-    await this.db
-      .insert(agentPresetGrants)
-      .values({ presetName: name, granteeType, grantee })
-      .onConflictDoNothing();
-    await this.audit.log(username, 'agent_grant', `${name}:${granteeType}:${grantee}`);
+    await this.applyGrant('agent', name, body, username, true);
   }
 
   async revokeAgentGrant(
@@ -769,20 +935,6 @@ export class MarketplaceService {
     body: { username?: string; group?: string },
     username: string,
   ): Promise<void> {
-    const hasUser = body?.username != null && body.username !== '';
-    const raw = hasUser ? body!.username! : (body?.group ?? '');
-    const grantee = normalizeGrantee(raw);
-    if (!grantee) throw new ApiError('VALIDATION', '授权对象不合法', 400);
-    const granteeType = hasUser ? ('user' as const) : ('group' as const);
-    await this.db
-      .delete(agentPresetGrants)
-      .where(
-        and(
-          eq(agentPresetGrants.presetName, name),
-          eq(agentPresetGrants.granteeType, granteeType),
-          eq(agentPresetGrants.grantee, grantee),
-        ),
-      );
-    await this.audit.log(username, 'agent_revoke', `${name}:${granteeType}:${grantee}`);
+    await this.applyGrant('agent', name, body, username, false);
   }
 }

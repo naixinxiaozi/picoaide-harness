@@ -9,11 +9,14 @@ import {
   Post,
   Put,
   Query,
+  Res,
   UseGuards,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { AdminAuthGuard } from '../common/guards/admin-auth.guard';
 import { RbacGuard } from '../common/guards/rbac.guard';
 import { CurrentAdmin, Permissions, type AdminPrincipal } from '../common/decorators';
+import { writeArchiveResponse } from '../shared-skills/archive-response';
 import { AgentPresetsService } from './agent-presets.service';
 
 @Controller('api/server/admin/agent-presets')
@@ -29,9 +32,9 @@ export class AgentPresetsAdminController {
 
   @Get(':name/archive')
   @Permissions('capability:read')
-  async archive(@Param('name') name: string) {
-    await this.presets.download(name);
-    return undefined;
+  async archive(@Param('name') name: string, @Res() res: Response): Promise<void> {
+    const payload = await this.presets.download(name);
+    writeArchiveResponse(res, payload, 'X-Preset-Version', 'X-Preset-Checksum');
   }
 
   @Get(':name/preview')
@@ -78,9 +81,10 @@ export class AgentPresetsAdminController {
   async archiveVersion(
     @Param('name') name: string,
     @Param('version') version: string,
-  ) {
-    await this.presets.download(name, version);
-    return undefined;
+    @Res() res: Response,
+  ): Promise<void> {
+    const payload = await this.presets.download(name, version);
+    writeArchiveResponse(res, payload, 'X-Preset-Version', 'X-Preset-Checksum');
   }
 
   @Get(':name/:version/preview')

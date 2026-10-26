@@ -2,6 +2,7 @@ import {
   bigint,
   bigserial,
   index,
+  integer,
   pgTable,
   text,
   timestamp,
@@ -21,6 +22,10 @@ export const auditLogs = pgTable(
     detail: text('detail').notNull().default(''),
     prevHash: text('prev_hash').notNull().default(''),
     hash: text('hash').notNull().default(''),
+    /** 关联应用（可空）；技能/智能体相关审计写入 kind-appid 之外的标识时使用。 */
+    appId: text('app_id'),
+    /** 哈希链版本（0048 首版为 1）。 */
+    hashVersion: integer('hash_version').notNull().default(1),
     createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' })
       .notNull()
       .defaultNow(),

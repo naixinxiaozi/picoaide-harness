@@ -1,16 +1,17 @@
 import { and, eq } from 'drizzle-orm';
 import { Inject, Injectable } from '@nestjs/common';
 import { DRIZZLE, type Database } from '../db/database.module';
-import {
-  connectors,
-  gatewayProviders,
-  models,
-  skillGrants,
-  skills,
-} from '../db/schema';
+import { connectors, gatewayProviders, models, type AppRelease } from '../db/schema';
 import { SettingsService } from '../settings/settings.service';
 import { resolveUserEffectiveGroups } from '../common/effective-groups';
-import { granteeMatch } from '../common/skills-shared';
+import {
+  CHANNEL_MARKET,
+  STATUS_APPROVED,
+  accessibleAppIds,
+  compareVersions,
+  listApps,
+  listReleasesByStatus,
+} from '../common/apps-shared';
 
 const VALID_THINKING_LEVELS = new Set(['off', 'low', 'high', 'max']);
 
@@ -18,6 +19,15 @@ export interface BootstrapUser {
   userId: number;
   username: string;
   role: string;
+  /** users.is_admin（1=管理员）；Go bootstrap.Build 用 IsAdmin 判全量。 */
+  isAdmin: number;
+}
+
+/** bootstrap.skills 条目（形状照 Go bootstrap.SkillItem：name/version/description）。 */
+interface SkillEntry {
+  name: string;
+  version: string;
+  description: string;
 }
 
 function parseInputModalities(raw: string): string[] {
@@ -147,31 +157,49 @@ export class BootstrapService {
     return list.some((m) => m.id === id);
   }
 
-  private async listSkills(): Promise<{ name: string; version: string; description: string }[]> {
-    const rows = await this.db
-      .select({
-        name: skills.name,
-        version: skills.version,
-        description: skills.description,
-      })
-      .from(skills)
-      .where(eq(skills.enabled, 1))
-      .orderBy(skills.id);
-    return rows.map((r) => ({ name: r.name, version: r.version, description: r.description ?? '' }));
+  /**
+   * 市场技能清单（apps kind='skill' channel='market'）：只取已上架行，
+   * 版本 = 最高 approved（未软删）版本；无 approved 版本时 version 为空串
+   * （与 Go bootstrap/build 的 ListSkills(enabledOnly=true) 一致）。
+   */
+  private async listSkills(): Promise<SkillEntry[]> {
+    const [apps, releases] = await Promise.all([
+      listApps(this.db, 'skill', CHANNEL_MARKET),
+      listReleasesByStatus(this.db, 'skill'),
+    ]);
+    const best = new Map<string, AppRelease>();
+    for (const r of releases) {
+      if (r.status !== STATUS_APPROVED || r.deletedAt) continue;
+      const cur = best.get(r.appId);
+      if (!cur || compareVersions(r.version, cur.version) > 0) best.set(r.appId, r);
+    }
+    const out: SkillEntry[] = [];
+    for (const a of apps) {
+      if (a.enabled !== 1 || a.deletedAt) continue;
+      const r = best.get(a.appId);
+      out.push({
+        name: a.appId,
+        version: r?.version ?? '',
+        description: a.description || r?.description || '',
+      });
+    }
+    return out;
   }
 
+  /**
+   * 技能授权（严格对齐 Go bootstrap.Build）：is_admin 全量；否则仅
+   * app_grants 授权（直接授权给用户或任一有效部门）。Go 的
+   * AccessibleSkillNames 不含「归属人本人」，这里刻意不加 owner 并集。
+   */
   private async authorizeSkills(
     user: BootstrapUser,
-    all: { name: string; version: string; description: string }[],
-  ): Promise<{ name: string; version: string; description: string }[]> {
+    all: SkillEntry[],
+  ): Promise<SkillEntry[]> {
+    // Go: user.IsAdmin 由 role 派生（users.go: IsAdmin = Role==super_admin）。
     if (user.role === 'super_admin') return all;
     const groups = await resolveUserEffectiveGroups(this.db, user.userId);
-    const granted = await this.db
-      .selectDistinct({ skillName: skillGrants.skillName })
-      .from(skillGrants)
-      .where(granteeMatch(user.username, groups));
-    const allowed = new Set(granted.map((g) => g.skillName));
-    return all.filter((s) => allowed.has(s.name));
+    const granted = new Set(await accessibleAppIds(this.db, 'skill', user.username, groups));
+    return all.filter((s) => granted.has(s.name));
   }
 
   private async listConnectors(): Promise<

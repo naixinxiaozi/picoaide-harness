@@ -9,11 +9,14 @@ import {
   Post,
   Put,
   Query,
+  Res,
   UseGuards,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { CurrentAdmin, Permissions, type AdminPrincipal } from '../common/decorators';
 import { AdminAuthGuard } from '../common/guards/admin-auth.guard';
 import { RbacGuard } from '../common/guards/rbac.guard';
+import { sendArchive } from './archive-response';
 import { MarketplaceService } from './marketplace.service';
 
 /**
@@ -92,8 +95,10 @@ export class MarketplaceAdminSkillsController {
 
   @Get(':name/archive')
   @Permissions('market:read')
-  archive(@Param('name') name: string) {
-    return this.svc.downloadSkillArchive(name);
+  async archive(@Param('name') name: string, @Res() res: Response) {
+    // 管理面不过分发闸门：下架技能也允许管理员取回归档复核。
+    const payload = await this.svc.downloadSkillArchive(name);
+    sendArchive(res, payload, 'X-Skill');
   }
 
   @Post(':name/normalize')

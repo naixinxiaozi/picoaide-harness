@@ -20,6 +20,10 @@ export const gatewayFiles = pgTable(
       .notNull()
       .defaultNow(),
     expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'date' }),
+    /** 回收标记（0079）：非空表示已进入回收流程，避免并发重复回收。 */
+    reapingAt: timestamp('reaping_at', { withTimezone: true, mode: 'date' }),
+    /** 回收代数（0081）：每次回收尝试 +1，用于幂等对账。 */
+    reapGen: bigint('reap_gen', { mode: 'number' }).notNull().default(0),
   },
   (table) => [
     index('idx_gateway_files_user_created').on(

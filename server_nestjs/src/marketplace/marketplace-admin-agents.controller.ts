@@ -9,16 +9,19 @@ import {
   Post,
   Put,
   Query,
+  Res,
   UseGuards,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { CurrentAdmin, Permissions, type AdminPrincipal } from '../common/decorators';
 import { AdminAuthGuard } from '../common/guards/admin-auth.guard';
 import { RbacGuard } from '../common/guards/rbac.guard';
+import { sendArchive } from './archive-response';
 import { MarketplaceService } from './marketplace.service';
 
 /**
  * 管理面市场智能体（/api/server/admin/agents，market:read/write，channel=market）。
- * 市场智能体无审核（直接 approved），复用 agent_presets 表（无 enabled 列 → 上/下架为校验+审计的 no-op）。
+ * 统一应用模型：apps(kind='agent', channel='market') + app_releases + app_grants。
  */
 @Controller('api/server/admin/agents')
 @UseGuards(AdminAuthGuard, RbacGuard)
@@ -97,8 +100,9 @@ export class MarketplaceAdminAgentsController {
 
   @Get(':name/archive')
   @Permissions('market:read')
-  archive(@Param('name') name: string) {
-    return this.svc.downloadAgentArchive(name);
+  async archive(@Param('name') name: string, @Res() res: Response) {
+    const payload = await this.svc.downloadAgentArchive(name);
+    sendArchive(res, payload, 'X-Preset');
   }
 
   @Get(':name/grants')

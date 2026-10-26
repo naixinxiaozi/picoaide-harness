@@ -151,7 +151,7 @@ export class AuditAdminService {
 
   /** 清理超过 days 天的审计日志（保留被删批次中最新一条作为哈希链锚点）。 */
   async purgeOld(days: number): Promise<number> {
-    const cutoff = new Date(Date.now() - days * 86400_000);
+    const cutoff = new Date(Date.now() - days * 86400_000).toISOString();
     try {
       const rows = await this.db
         .delete(auditLogs)

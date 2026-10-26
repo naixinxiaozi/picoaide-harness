@@ -23,10 +23,9 @@ export const clientErrorReportingStatus = pgTable('client_error_reporting_status
 export type ClientErrorReportingStatus =
   typeof clientErrorReportingStatus.$inferSelect;
 
-/** LDAP 全量同步用户台账（0060）：空组即回收。 */
+/** LDAP 全量同步用户台账（0060，2026-09 审计改为按用户名）：空组即回收。 */
 export const ldapSyncedUsers = pgTable('ldap_synced_users', {
-  userId: bigint('user_id', { mode: 'number' }).primaryKey(),
-  externalId: text('external_id').notNull(),
+  username: text('username').primaryKey(),
   syncedAt: timestamp('synced_at', { withTimezone: true, mode: 'date' })
     .notNull()
     .defaultNow(),

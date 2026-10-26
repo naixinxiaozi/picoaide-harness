@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, desc, eq, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DRIZZLE, Database } from '../db/database.module';
 import { gatewayProviders, groups, models, usage, userGroups, users } from '../db/schema';
 import { ApiError } from '../common/errors/api-error';
@@ -183,11 +183,11 @@ export class UsageService {
         SUM(cache_prompt_tokens)::float8 AS ctk,
         SUM(cost)::float8 AS cost
       FROM usage${sql.raw(join)}
-      WHERE created_at >= ${from} AND created_at < ${toEx}
+      WHERE created_at >= ${from.toISOString()} AND created_at < ${toEx.toISOString()}
         ${username ? sql`AND usage.user_id = (SELECT id FROM users WHERE username = ${username})` : sql``}
         ${model ? sql`AND usage.model = ${model}` : sql``}
         ${kind ? sql`AND usage.kind = ${kind}` : sql``}
-        ${deptGroupIds && deptGroupIds.length > 0 ? sql`AND usage.user_id IN (SELECT user_id FROM user_groups WHERE group_id = ANY(${deptGroupIds}::bigint[]))` : sql``}
+        ${deptGroupIds && deptGroupIds.length > 0 ? sql`AND usage.user_id IN (SELECT user_id FROM user_groups WHERE group_id IN ${sql.raw(`(${deptGroupIds.map((n) => Math.trunc(Number(n))).join(',')})`)})` : sql``}
       GROUP BY ${sql.raw(groupBy)}
       ORDER BY label
     `);
@@ -293,10 +293,14 @@ export class UsageService {
     const tree = await this.loadGroupTree();
     const depts = await this.userDepts(tree);
     const usersById = new Map<number, string>();
-    if (rows.length > 0) {
-      const userRows = await this.db.execute<{ id: number; username: string }>(
-        sql`SELECT id, username FROM users WHERE id = ANY(${rows.map((r) => Number(r.label)).filter((n) => Number.isInteger(n))}::bigint[])`,
-      );
+    const ids = rows
+      .map((r) => Number(r.label))
+      .filter((n) => Number.isInteger(n));
+    if (ids.length > 0) {
+      const userRows = await this.db
+        .select({ id: users.id, username: users.username })
+        .from(users)
+        .where(inArray(users.id, ids));
       for (const r of userRows) {
         usersById.set(Number(r.id), r.username);
       }
@@ -396,7 +400,10 @@ export class UsageService {
     const s = Number.isFinite(size) && size >= 1 && size <= 100 ? Math.floor(size) : 20;
     const offset = (p - 1) * s;
 
-    const conds = [sql`${usage.createdAt} >= ${from}`, sql`${usage.createdAt} < ${toEx}`];
+    const conds = [
+      sql`${usage.createdAt} >= ${from.toISOString()}`,
+      sql`${usage.createdAt} < ${toEx.toISOString()}`,
+    ];
     if (username) conds.push(sql`${usage.userId} = (SELECT id FROM users WHERE username = ${username})`);
     if (model) conds.push(eq(usage.model, model));
     if (k !== '') conds.push(eq(usage.kind, k as never));

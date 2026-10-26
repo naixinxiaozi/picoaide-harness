@@ -1,31 +1,81 @@
-import { Inject, Injectable } from '@nestjs/common';
-import { and, desc, eq, ne, sql } from 'drizzle-orm';
-import { DRIZZLE, type Database } from '../db/database.module';
-import {
-  agentPresetGrants,
-  agentPresets,
-  groups,
-  type AgentPreset,
-} from '../db/schema';
-import { ApiError } from '../common/errors/api-error';
-import { AuditService } from '../audit/audit.service';
-import { CryptoService } from '../common/crypto/crypto.service';
-import { rfc3339UTC } from '../common/time';
-import {
-  granteeMatch,
-  isAppId,
-  normalizeGrantee,
-  resolveUserGroupNames,
-} from '../common/skills-shared';
+/**
+ * 智能体预置（组织共享面，kind='agent' + channel='org'）。
+ *
+ * 数据模型：apps / app_releases / app_grants（旧 agent_presets、agent_preset_grants 已下线）。
+ * 语义与 Go 端 internal/serverstore/agent_presets.go + internal/agentshare/routes.go 对齐：
+ *  - 员工面列表只发 org 通道「已通过审核 + 已分发」的版本；
+ *  - 「我的」= 自己 App 的全部版本（忽略审核状态与下架）；
+ *  - 无版本号的接口取「最高已通过版本，否则最新版本」（latestPresetRelease）；
+ *  - 审核（无版本号）取「最高未通过版本，否则最新版本」（GetAgentPresetForReview）；
+ *  - 整名删除 = 软删全部版本 + 清授权，**不删 apps 行**（app_releases 外键 ON DELETE
+ *    CASCADE，硬删会连带删掉版本历史）。
+ */
 
-/** 共享 Agent 预设 JSON（snake_case；无 quality/downloads 列 → 默认）。 */
+import { createHash } from 'node:crypto';
+import { Inject, Injectable } from '@nestjs/common';
+import { and, eq, isNull, sql } from 'drizzle-orm';
+import { DRIZZLE, type Database } from '../db/database.module';
+import { appReleases, groups, users, type App, type AppRelease } from '../db/schema';
+import { AuditService } from '../audit/audit.service';
+import { ApiError } from '../common/errors/api-error';
+import { formatDateTime, isAppId, isVersion, normalizeGrantee } from '../common/skills-shared';
+import { resolveUserEffectiveGroups } from '../common/effective-groups';
+import {
+  CHANNEL_MARKET,
+  CHANNEL_ORG,
+  STATUS_APPROVED,
+  STATUS_PENDING,
+  STATUS_REJECTED,
+  accessibleAppIds,
+  appDistribution,
+  compareVersions,
+  createRelease,
+  currentRelease,
+  deleteAppGrants,
+  delivered,
+  distributionOf,
+  distributionStates,
+  getApp,
+  getRelease,
+  grantApp,
+  incrementReleaseDownload,
+  listAppGrants,
+  listApps,
+  listReleases,
+  listReleasesByStatus,
+  ownedBy,
+  replaceGroupGrants,
+  revokeApp,
+  setAppEnabled,
+  setReleaseQuality,
+  setReleaseStatusForReview,
+  softDeleteRelease,
+  upsertApp,
+  writable,
+} from '../common/apps-shared';
+import { isGzip, isZip, listArchiveEntries, readArchiveEntry, readArchiveText } from '../shared-skills/zip-archive';
+
+const KIND = 'agent' as const;
+const MAX_ARCHIVE_BYTES = 16 * 1024 * 1024;
+const MAX_REASON_LEN = 500;
+/** 单文件预览上限（Go presetFileContent 为 1MB）。 */
+const MAX_FILE_BYTES = 1024 * 1024;
+/** preset.yml 展示上限（复用 128KB 的 SKILL.md 口径，防大文件回显）。 */
+const MAX_MANIFEST_BYTES = 128 * 1024;
+const QUALITY_FLAGS = new Set(['', 'featured']);
+const REASON_MISSING = '请填写拒绝理由';
+const REASON_TOO_LONG = '拒绝理由过长(上限 500 字)';
+const PRESET_MISSING = '预设不存在';
+const NOT_REJECTABLE = '已审核通过的版本不可驳回';
+
+/** 智能体预置 JSON（snake_case，与 Go presetJSON 逐字段对齐；无 calls）。 */
 export interface PresetJSON {
   name: string;
   display_name: string;
   description: string;
   version: string;
   author: string;
-  status: 'pending' | 'approved' | 'rejected';
+  status: string;
   reason: string;
   quality: string;
   downloads: number;
@@ -38,559 +88,597 @@ export interface PresetGrantJSON {
   grantee: string;
 }
 
-const MAX_ARCHIVE_BYTES = 16 * 1024 * 1024; // 16 MiB
-const MAX_REASON_LEN = 500;
+export interface ArchivePayload {
+  payload: Buffer;
+  filename: string;
+  contentType: string;
+  version: string;
+  checksum: string;
+}
+
+export interface PresetPreviewJSON {
+  files: Array<{ path: string; size: number }>;
+  composition: string;
+}
+
+export interface PresetFileJSON {
+  path: string;
+  size: number;
+  binary: boolean;
+  too_large: boolean;
+  content: string;
+}
+
+export interface PresetUploadBody {
+  name?: unknown;
+  display_name?: unknown;
+  version?: unknown;
+  description?: unknown;
+  author?: unknown;
+  archive?: unknown;
+}
+
+export interface PresetGrantBody {
+  username?: unknown;
+  group?: unknown;
+}
+
+export interface PresetEnabledBody {
+  enabled?: unknown;
+}
+
+function text(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function checksumOf(payload: Buffer): string {
+  return createHash('sha256').update(payload).digest('hex');
+}
+
+function archiveFilename(name: string, version: string, payload: Buffer): string {
+  const suffix = isZip(payload) ? 'zip' : isGzip(payload) ? 'tar.gz' : 'bin';
+  return `${name}-${version}.${suffix}`;
+}
 
 @Injectable()
 export class AgentPresetsService {
   constructor(
     @Inject(DRIZZLE) private readonly db: Database,
     private readonly audit: AuditService,
-    private readonly crypto: CryptoService,
   ) {}
-
-  private toJSON(p: AgentPreset): PresetJSON {
-    return {
-      name: p.name,
-      display_name: p.displayName,
-      description: p.description,
-      version: p.version,
-      author: p.author,
-      status: p.status,
-      reason: p.reason,
-      quality: '',
-      downloads: 0,
-      created_at: rfc3339UTC(p.createdAt),
-      updated_at: rfc3339UTC(p.updatedAt),
-    };
-  }
 
   private adminFull(role: string): boolean {
     return role === 'super_admin' || role === 'auditor';
   }
 
-  private decodeArchive(archive: unknown): string {
-    if (typeof archive !== 'string' || archive.length === 0) {
-      throw new ApiError('VALIDATION', '归档编码错误或为空', 400);
-    }
-    let buf: Buffer;
-    try {
-      buf = Buffer.from(archive, 'base64');
-      if (
-        buf.toString('base64').replace(/=+$/, '') !==
-        archive.replace(/=+$/, '')
-      ) {
-        throw new Error('bad base64');
+  private toJSON(release: AppRelease, app: App | null): PresetJSON {
+    const displayName = text(app?.title) || release.appId;
+    const description = text(app?.description) || (release.description ?? '');
+    return {
+      name: release.appId,
+      display_name: displayName,
+      description,
+      version: release.version,
+      // Go 投影：Author 取 publisher（上传账号），老数据可能只有 author。
+      author: release.publisher || release.author || '',
+      status: release.status,
+      reason: release.reason ?? '',
+      quality: release.quality ?? '',
+      downloads: Number(release.downloads ?? 0),
+      created_at: formatDateTime(release.createdAt),
+      updated_at: formatDateTime(release.updatedAt),
+    };
+  }
+
+  private sortRows(
+    rows: Array<{ release: AppRelease; app: App | null }>,
+  ): Array<{ release: AppRelease; app: App | null }> {
+    return rows.sort((left, right) => {
+      if (left.release.appId !== right.release.appId) {
+        return left.release.appId < right.release.appId ? -1 : 1;
       }
-    } catch {
-      throw new ApiError('VALIDATION', '归档编码错误或为空', 400);
-    }
-    if (buf.length === 0) throw new ApiError('VALIDATION', '归档编码错误或为空', 400);
-    if (buf.length > MAX_ARCHIVE_BYTES) {
-      throw new ApiError('PAYLOAD_TOO_LARGE', '归档过大(上限 16MB)');
-    }
-    return this.crypto.sha256(buf.toString('binary'));
+      return compareVersions(right.release.version, left.release.version);
+    });
   }
 
-  /** 展示版本：最高 approved；否则最新 created；否则 null。 */
-  private async displayVersion(name: string): Promise<AgentPreset | undefined> {
-    const [approved] = await this.db
-      .select()
-      .from(agentPresets)
-      .where(and(eq(agentPresets.name, name), eq(agentPresets.status, 'approved')))
-      .orderBy(desc(agentPresets.createdAt))
-      .limit(1);
-    if (approved) return approved;
-    const [latest] = await this.db
-      .select()
-      .from(agentPresets)
-      .where(eq(agentPresets.name, name))
-      .orderBy(desc(agentPresets.createdAt))
-      .limit(1);
-    return latest;
+  private async requireOrgAgent(name: string): Promise<App> {
+    const app = await getApp(this.db, KIND, name);
+    if (!app || app.channel !== CHANNEL_ORG) throw new ApiError('NOT_FOUND', PRESET_MISSING);
+    return app;
   }
 
-  // ------------------------------------------------------------ employee
+  private async orgApps(): Promise<Map<string, App>> {
+    const rows = await listApps(this.db, KIND, CHANNEL_ORG);
+    return new Map(rows.map((app) => [app.appId, app]));
+  }
 
-  /** 员工面分发：approved ∧ (owner 或 已授权)；admin 全量 approved。 */
+  /** 未软删的版本（按 createdAt/id 升序，与 listReleases 一致）。 */
+  private async liveReleases(name: string): Promise<AppRelease[]> {
+    const rows = await listReleases(this.db, KIND, name);
+    return rows.filter((row) => !row.deletedAt);
+  }
+
+  /** latestPresetRelease：最高已通过版本，否则最新版本。 */
+  private async displayVersion(name: string): Promise<string> {
+    const current = await currentRelease(this.db, KIND, name);
+    if (current) return current.version;
+    const rows = await this.liveReleases(name);
+    if (rows.length === 0) throw new ApiError('NOT_FOUND', PRESET_MISSING);
+    const newest = rows.reduce((left, right) =>
+      right.createdAt.getTime() > left.createdAt.getTime() ||
+      (right.createdAt.getTime() === left.createdAt.getTime() && Number(right.id) > Number(left.id))
+        ? right
+        : left,
+    );
+    return newest.version;
+  }
+
+  /** GetAgentPresetForReview：最高未通过版本，否则最新版本。 */
+  private async reviewTarget(name: string): Promise<string> {
+    const rows = (await this.liveReleases(name)).filter((row) => row.status !== STATUS_APPROVED);
+    if (rows.length === 0) return this.displayVersion(name);
+    rows.sort((left, right) => compareVersions(right.version, left.version));
+    return rows[0].version;
+  }
+
+  /** 员工面可见预置：已通过审核 + 已分发 +（管理员 / 本人 / 被授权）。 */
   async listVisibleForEmployee(
     username: string,
     role: string,
     userId: number,
-  ): Promise<PresetJSON[]> {
-    const rows = await this.db
-      .select()
-      .from(agentPresets)
-      .orderBy(agentPresets.name, agentPresets.version);
-
-    if (this.adminFull(role)) {
-      return rows.filter((r) => r.status === 'approved').map((r) => this.toJSON(r));
+  ): Promise<Array<PresetJSON & { enabled: boolean }>> {
+    const appsById = await this.orgApps();
+    if (appsById.size === 0) return [];
+    const states = await distributionStates(this.db, KIND);
+    let granted: Set<string> | null = null;
+    if (!this.adminFull(role)) {
+      const groupsOfUser = await resolveUserEffectiveGroups(this.db, userId);
+      const names = await accessibleAppIds(this.db, KIND, username, groupsOfUser);
+      granted = new Set(names.map((item) => item.toLowerCase()));
     }
-
-    const groups = await resolveUserGroupNames(this.db, userId);
-    const grantedRows = await this.db
-      .selectDistinct({ name: agentPresetGrants.presetName })
-      .from(agentPresetGrants)
-      .where(granteeMatch(username, groups));
-    const grantedSet = new Set(grantedRows.map((g) => g.name));
-
-    return rows
-      .filter(
-        (r) =>
-          r.author === username ||
-          (r.status === 'approved' && grantedSet.has(r.name)),
-      )
-      .map((r) => this.toJSON(r));
-  }
-
-  /** 员工面「我的」分区（capabilities source=own 复用）。 */
-  async listOwned(username: string): Promise<PresetJSON[]> {
-    const rows = await this.db
-      .select()
-      .from(agentPresets)
-      .where(eq(agentPresets.author, username))
-      .orderBy(agentPresets.name, agentPresets.version);
-    return rows.map((r) => this.toJSON(r));
-  }
-
-  /** 员工面：上传共享 Agent 预设 → pending。 */
-  async upload(
-    body: {
-      name?: string;
-      display_name?: string;
-      version?: string;
-      description?: string;
-      archive?: unknown;
-    },
-    username: string,
-  ): Promise<{ name: string; version: string; status: 'pending' }> {
-    const name = (body?.name ?? '').trim();
-    if (!name) throw new ApiError('VALIDATION', '名称必填', 400);
-    if (!isAppId(name)) {
-      throw new ApiError('INVALID_APP_ID', '预设名不合法:必须是小写 kebab-case');
-    }
-    // 市场同名（status=approved 视为市场智能体）→ 跨通道冲突。
-    const [market] = await this.db
-      .select({ name: agentPresets.name })
-      .from(agentPresets)
-      .where(and(eq(agentPresets.name, name), eq(agentPresets.status, 'approved')))
-      .limit(1);
-    if (market) throw new ApiError('CONFLICT', '名称与市场智能体冲突');
-
-    const version = (body?.version ?? '').trim() || '1.0.0';
-    const displayName = body?.display_name ?? '';
-    const description = body?.description ?? '';
-    const checksum = this.decodeArchive(body?.archive);
-
-    const [existing] = await this.db
-      .select()
-      .from(agentPresets)
-      .where(and(eq(agentPresets.name, name), eq(agentPresets.version, version)))
-      .limit(1);
-    if (existing) {
-      if (existing.status === 'rejected') {
-        await this.db
-          .update(agentPresets)
-          .set({
-            displayName,
-            description,
-            checksum,
-            status: 'pending',
-            reason: '',
-            updatedAt: new Date(),
-          })
-          .where(eq(agentPresets.id, existing.id));
-        return { name, version, status: 'pending' };
+    const rows = await listReleasesByStatus(this.db, KIND);
+    const visible: Array<{ release: AppRelease; app: App | null }> = [];
+    for (const release of rows) {
+      const app = appsById.get(release.appId);
+      if (!app) continue;
+      if (release.status !== STATUS_APPROVED) continue;
+      const dist = distributionOf(states, release.appId);
+      if (!delivered(dist)) continue;
+      if (granted && !ownedBy(dist, username) && !granted.has(release.appId.toLowerCase())) {
+        continue;
       }
-      throw new ApiError('VALIDATION', '该版本已存在', 400);
+      visible.push({ release, app });
+    }
+    return this.sortRows(visible).map(({ release, app }) => ({
+      ...this.toJSON(release, app),
+      enabled: Boolean(app?.enabled),
+    }));
+  }
+
+  /** 作者面（我的）：自己 App 的全部版本，忽略审核状态与下架。 */
+  async listOwned(username: string): Promise<PresetJSON[]> {
+    const appsById = await this.orgApps();
+    if (appsById.size === 0) return [];
+    const states = await distributionStates(this.db, KIND);
+    const rows = await listReleasesByStatus(this.db, KIND);
+    const owned: Array<{ release: AppRelease; app: App | null }> = [];
+    for (const release of rows) {
+      const app = appsById.get(release.appId);
+      if (!app) continue;
+      if (!ownedBy(distributionOf(states, release.appId), username)) continue;
+      owned.push({ release, app });
+    }
+    return this.sortRows(owned).map(({ release, app }) => this.toJSON(release, app));
+  }
+
+  private normalizeStatus(status: unknown): string | null {
+    const value = text(status);
+    if (!value) return null;
+    if (value === STATUS_PENDING || value === STATUS_APPROVED || value === STATUS_REJECTED) {
+      return value;
+    }
+    return '__invalid__';
+  }
+
+  /** 管理面：org 通道全部版本（含审核中 / 已拒绝，不含已软删）。 */
+  async listAll(status?: string): Promise<PresetJSON[]> {
+    const wanted = this.normalizeStatus(status);
+    if (wanted === '__invalid__') return [];
+    const appsById = await this.orgApps();
+    if (appsById.size === 0) return [];
+    const rows = await listReleasesByStatus(this.db, KIND, wanted ?? undefined);
+    const kept: Array<{ release: AppRelease; app: App | null }> = [];
+    for (const release of rows) {
+      const app = appsById.get(release.appId);
+      if (!app) continue;
+      kept.push({ release, app });
+    }
+    return this.sortRows(kept).map(({ release, app }) => this.toJSON(release, app));
+  }
+
+  private decodeArchive(raw: unknown): Buffer {
+    if (typeof raw !== 'string' || raw.trim() === '') {
+      throw new ApiError('VALIDATION', '归档内容必填(base64)');
+    }
+    const cleaned = raw.replace(/\s+/g, '');
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(cleaned)) {
+      throw new ApiError('VALIDATION', '归档内容必须是合法 base64');
+    }
+    const payload = Buffer.from(cleaned, 'base64');
+    if (payload.length === 0) throw new ApiError('VALIDATION', '归档内容为空');
+    if (payload.length > MAX_ARCHIVE_BYTES) {
+      throw new ApiError('PAYLOAD_TOO_LARGE', `归档大小超过上限(${MAX_ARCHIVE_BYTES} 字节)`);
+    }
+    return payload;
+  }
+
+  /** 上传：upsertApp + createRelease(status=pending)。同 (kind,appId,version) 冲突。 */
+  async upload(
+    body: PresetUploadBody,
+    username: string,
+  ): Promise<{ name: string; version: string; status: string }> {
+    const name = text(body?.name);
+    if (!name) throw new ApiError('VALIDATION', '预设名必填');
+    if (!isAppId(name)) {
+      throw new ApiError('INVALID_APP_ID', '预设名不合法:必须是小写 kebab-case(2-64 字符)');
+    }
+    const version = text(body?.version) || '1.0.0';
+    if (!isVersion(version)) {
+      throw new ApiError('VALIDATION', '版本号不合法:必须是 x.y.z(可带 -rc.1 预发布后缀)');
+    }
+    const payload = this.decodeArchive(body?.archive);
+
+    const existingApp = await getApp(this.db, KIND, name);
+    if (existingApp && existingApp.channel === CHANNEL_MARKET) {
+      throw new ApiError('CONFLICT', '名称与市场智能体冲突,请先处理市场智能体或驳回该预设');
+    }
+    if (await getRelease(this.db, KIND, name, version)) {
+      throw new ApiError('CONFLICT', '该版本已存在');
     }
 
-    await this.db.insert(agentPresets).values({
-      name,
-      displayName,
-      version,
+    const displayName = text(body?.display_name) || name;
+    const description = text(body?.description);
+    const author = text(body?.author) || username;
+    const checksum = checksumOf(payload);
+
+    await upsertApp(this.db, {
+      kind: KIND,
+      appId: name,
+      title: displayName,
       description,
-      author: username,
+      owner: username,
+      channel: CHANNEL_ORG,
+    });
+    await createRelease(this.db, {
+      kind: KIND,
+      appId: name,
+      version,
+      title: displayName,
+      description,
+      author,
+      publisher: username,
       checksum,
-      status: 'pending',
-      reason: '',
+      archive: payload,
+      status: STATUS_PENDING,
     });
     await this.audit.log(username, 'agent_preset_upload', `${name}@${version}`);
-    return { name, version, status: 'pending' };
+    return { name, version, status: STATUS_PENDING };
   }
 
-  /** 员工面：归档下载（双通道；owner / approved+授权；未授权 404）。 */
+  private buildPayload(release: AppRelease): ArchivePayload {
+    if (!release.archive || release.archive.length === 0) {
+      throw new ApiError('INTERNAL', '归档数据缺失');
+    }
+    return {
+      payload: release.archive,
+      filename: archiveFilename(release.appId, release.version, release.archive),
+      contentType: isZip(release.archive) ? 'application/zip' : 'application/gzip',
+      version: release.version,
+      checksum: release.checksum || checksumOf(release.archive),
+    };
+  }
+
+  /**
+   * 员工面下载（与 Go serveArchive 对齐）：已通过审核 + 已分发 +（本人 / 被授权）。
+   * 与列表不同，这里同时服务 org 与 market 通道（Go 安装路径如此）。
+   */
   async downloadForEmployee(
     name: string,
     version: string | undefined,
     username: string,
     role: string,
     userId: number,
-  ): Promise<void> {
-    let row: AgentPreset | undefined;
-    if (version) {
-      const [r] = await this.db
-        .select()
-        .from(agentPresets)
-        .where(and(eq(agentPresets.name, name), eq(agentPresets.version, version)))
-        .limit(1);
-      row = r;
-    } else {
-      row = await this.displayVersion(name);
+  ): Promise<ArchivePayload> {
+    const app = await getApp(this.db, KIND, name);
+    if (!app) throw new ApiError('NOT_FOUND', PRESET_MISSING);
+    const target = version ?? (await this.displayVersion(name));
+    const release = await getRelease(this.db, KIND, name, target);
+    if (!release || release.deletedAt) throw new ApiError('NOT_FOUND', PRESET_MISSING);
+    if (release.status !== STATUS_APPROVED) throw new ApiError('NOT_FOUND', PRESET_MISSING);
+    const dist = await appDistribution(this.db, KIND, name);
+    if (!delivered(dist)) throw new ApiError('NOT_FOUND', PRESET_MISSING);
+    if (!this.adminFull(role) && !ownedBy(dist, username)) {
+      const groupsOfUser = await resolveUserEffectiveGroups(this.db, userId);
+      const names = await accessibleAppIds(this.db, KIND, username, groupsOfUser);
+      const hit = names.some((item) => item.toLowerCase() === name.toLowerCase());
+      if (!hit) throw new ApiError('NOT_FOUND', PRESET_MISSING);
     }
-    if (!row) throw new ApiError('NOT_FOUND', '预设不存在');
-
-    if (!this.adminFull(role)) {
-      if (row.author !== username) {
-        if (row.status !== 'approved') {
-          throw new ApiError('NOT_FOUND', '预设不存在');
-        }
-        const groups = await resolveUserGroupNames(this.db, userId);
-        const [g] = await this.db
-          .select()
-          .from(agentPresetGrants)
-          .where(
-            and(
-              eq(agentPresetGrants.presetName, name),
-              granteeMatch(username, groups),
-            ),
-          )
-          .limit(1);
-        if (!g) throw new ApiError('NOT_FOUND', '预设不存在');
-      }
-    }
-    throw new ApiError('NOT_FOUND', '归档文件未存储');
+    const result = this.buildPayload(release);
+    await incrementReleaseDownload(this.db, KIND, name, target);
+    return result;
   }
 
-  // ------------------------------------------------------------ admin
-
-  async listAll(status?: string): Promise<PresetJSON[]> {
-    const rows = await this.db
-      .select()
-      .from(agentPresets)
-      .where(
-        status ? eq(agentPresets.status, status as AgentPreset['status']) : undefined,
-      )
-      .orderBy(agentPresets.name, agentPresets.version);
-    return rows.map((r) => this.toJSON(r));
+  /** 管理面下载：org 通道任意审核状态，跳过可见性门。 */
+  async download(name: string, version?: string): Promise<ArchivePayload> {
+    await this.requireOrgAgent(name);
+    const target = version ?? (await this.displayVersion(name));
+    const release = await getRelease(this.db, KIND, name, target);
+    if (!release || release.deletedAt) throw new ApiError('NOT_FOUND', PRESET_MISSING);
+    const result = this.buildPayload(release);
+    await incrementReleaseDownload(this.db, KIND, name, target);
+    return result;
   }
 
-  async download(name: string, version?: string): Promise<void> {
-    const row = version
-      ? (
-          await this.db
-            .select()
-            .from(agentPresets)
-            .where(and(eq(agentPresets.name, name), eq(agentPresets.version, version)))
-            .limit(1)
-        )[0]
-      : await this.displayVersion(name);
-    if (!row) throw new ApiError('NOT_FOUND', '预设不存在');
-    throw new ApiError('NOT_FOUND', '归档文件未存储');
+  private async previewOf(name: string, version?: string): Promise<PresetPreviewJSON> {
+    await this.requireOrgAgent(name);
+    const target = version ?? (await this.displayVersion(name));
+    const release = await getRelease(this.db, KIND, name, target);
+    if (!release || release.deletedAt) throw new ApiError('NOT_FOUND', PRESET_MISSING);
+    if (!release.archive || !isZip(release.archive)) return { files: [], composition: '' };
+    return {
+      files: listArchiveEntries(release.archive),
+      composition: readArchiveText(release.archive, 'preset.yml', MAX_MANIFEST_BYTES),
+    };
   }
 
-  async preview(name: string): Promise<{
-    files: unknown[];
-    composition: string;
-  }> {
-    const row = await this.displayVersion(name);
-    if (!row) throw new ApiError('NOT_FOUND', '预设不存在');
-    return { files: [], composition: '' };
+  async preview(name: string): Promise<PresetPreviewJSON> {
+    return this.previewOf(name);
   }
 
-  async previewVersion(name: string, version: string): Promise<{
-    files: unknown[];
-    composition: string;
-  }> {
-    const [row] = await this.db
-      .select()
-      .from(agentPresets)
-      .where(and(eq(agentPresets.name, name), eq(agentPresets.version, version)))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '预设不存在');
-    return { files: [], composition: '' };
+  async previewVersion(name: string, version: string): Promise<PresetPreviewJSON> {
+    return this.previewOf(name, version);
   }
 
-  /** 审核目标：最高非 approved 版本；无则回落展示版本（最高 approved）。 */
-  private async reviewTarget(name: string): Promise<AgentPreset> {
-    const [nonApproved] = await this.db
-      .select()
-      .from(agentPresets)
-      .where(and(eq(agentPresets.name, name), ne(agentPresets.status, 'approved')))
-      .orderBy(desc(agentPresets.createdAt))
-      .limit(1);
-    if (nonApproved) return nonApproved;
-    const display = await this.displayVersion(name);
-    if (!display) throw new ApiError('NOT_FOUND', '预设不存在');
-    return display;
-  }
-
-  async approve(name: string, username: string): Promise<void> {
-    const row = await this.reviewTarget(name);
-    await this.approveVersion(name, row.version, username);
-  }
-
-  async approveVersion(
+  private async fileOf(
     name: string,
-    version: string,
-    username: string,
-  ): Promise<void> {
-    const [row] = await this.db
-      .select()
-      .from(agentPresets)
-      .where(and(eq(agentPresets.name, name), eq(agentPresets.version, version)))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '预设不存在');
-    if (row.status === 'rejected') {
+    version: string | undefined,
+    rawPath: string,
+  ): Promise<PresetFileJSON> {
+    await this.requireOrgAgent(name);
+    const target = text(rawPath).replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!target) throw new ApiError('VALIDATION', '缺少文件路径');
+    const versionTarget = version ?? (await this.displayVersion(name));
+    const release = await getRelease(this.db, KIND, name, versionTarget);
+    if (!release || release.deletedAt) throw new ApiError('NOT_FOUND', PRESET_MISSING);
+    if (!release.archive || !isZip(release.archive)) throw new ApiError('NOT_FOUND', '文件不存在');
+    const found = readArchiveEntry(release.archive, target, MAX_FILE_BYTES);
+    if (!found) throw new ApiError('NOT_FOUND', '文件不存在');
+    return { path: target, ...found };
+  }
+
+  async file(name: string, version: string | undefined, path: string): Promise<PresetFileJSON> {
+    return this.fileOf(name, version, path);
+  }
+
+  private async marketAgentExists(name: string): Promise<boolean> {
+    const app = await getApp(this.db, KIND, name);
+    return Boolean(app && app.channel === CHANNEL_MARKET);
+  }
+
+  private async approveTarget(name: string, version: string, username: string): Promise<{ ok: true }> {
+    await this.requireOrgAgent(name);
+    const release = await getRelease(this.db, KIND, name, version);
+    if (!release || release.deletedAt) throw new ApiError('NOT_FOUND', PRESET_MISSING);
+    if (await this.marketAgentExists(name)) {
+      throw new ApiError('CONFLICT', '名称与市场智能体冲突,请先处理市场智能体或驳回该预设');
+    }
+    const dist = await appDistribution(this.db, KIND, name);
+    if (!writable(dist)) {
+      throw new ApiError('APP_DELISTED', '该智能体已下架，无法通过审核：请先重新上架再审核');
+    }
+    const outcome = await setReleaseStatusForReview(this.db, KIND, name, version, 'approved');
+    if (outcome === 'not_found') throw new ApiError('NOT_FOUND', PRESET_MISSING);
+    if (outcome === 'archive_cleared') {
       throw new ApiError(
         'ARCHIVE_CLEARED',
         '该版本归档已在拒绝时清理,无法再通过审核(拒绝即释放存储):请让作者上传新版本',
       );
     }
-    await this.db
-      .update(agentPresets)
-      .set({ status: 'approved', reason: '', updatedAt: new Date() })
-      .where(eq(agentPresets.id, row.id));
     await this.audit.log(username, 'agent_preset_approve', `${name}@${version}`);
+    return { ok: true };
   }
 
-  async reject(
+  /** 无版本号审核：对 reviewTarget（最高未通过版本）操作。 */
+  async approve(name: string, username: string): Promise<{ ok: true }> {
+    await this.requireOrgAgent(name);
+    const target = await this.reviewTarget(name);
+    return this.approveTarget(name, target, username);
+  }
+
+  async approveVersion(name: string, version: string, username: string): Promise<{ ok: true }> {
+    return this.approveTarget(name, version, username);
+  }
+
+  private validateReason(rawReason: string): string {
+    const reason = text(rawReason);
+    if (!reason) throw new ApiError('VALIDATION', REASON_MISSING);
+    if ([...reason].length > MAX_REASON_LEN) throw new ApiError('VALIDATION', REASON_TOO_LONG);
+    return reason;
+  }
+
+  private async rejectTarget(
     name: string,
+    version: string,
     reason: string,
     username: string,
-  ): Promise<void> {
-    const row = await this.reviewTarget(name);
-    await this.rejectVersion(name, row.version, reason, username);
+  ): Promise<{ ok: true }> {
+    await this.requireOrgAgent(name);
+    const release = await getRelease(this.db, KIND, name, version);
+    if (!release || release.deletedAt) throw new ApiError('NOT_FOUND', PRESET_MISSING);
+    const outcome = await setReleaseStatusForReview(this.db, KIND, name, version, 'rejected', reason);
+    if (outcome === 'not_found') throw new ApiError('NOT_FOUND', PRESET_MISSING);
+    if (outcome === 'approved_not_rejectable') {
+      throw new ApiError('APPROVED_NOT_REJECTABLE', NOT_REJECTABLE);
+    }
+    await this.audit.log(username, 'agent_preset_reject', `${name}@${version}`);
+    return { ok: true };
+  }
+
+  async reject(name: string, rawReason: string, username: string): Promise<{ ok: true }> {
+    const reason = this.validateReason(rawReason);
+    await this.requireOrgAgent(name);
+    const target = await this.reviewTarget(name);
+    return this.rejectTarget(name, target, reason, username);
   }
 
   async rejectVersion(
     name: string,
     version: string,
-    reason: string,
+    rawReason: string,
     username: string,
-  ): Promise<void> {
-    const [row] = await this.db
-      .select()
-      .from(agentPresets)
-      .where(and(eq(agentPresets.name, name), eq(agentPresets.version, version)))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '预设不存在');
-    if (!reason || reason.trim() === '') {
-      throw new ApiError('VALIDATION', '请填写拒绝理由', 400);
-    }
-    if (reason.length > MAX_REASON_LEN) {
-      throw new ApiError('VALIDATION', '拒绝理由过长(上限 500 字)', 400);
-    }
-    if (row.status === 'approved') {
-      throw new ApiError('APPROVED_NOT_REJECTABLE', '已审核通过的版本不可驳回');
-    }
+  ): Promise<{ ok: true }> {
+    const reason = this.validateReason(rawReason);
+    return this.rejectTarget(name, version, reason, username);
+  }
+
+  /** 整名删除：软删全部未删版本 + 清授权（apps 行保留，见文件头注释）。 */
+  async deleteAll(name: string, username: string): Promise<{ ok: true }> {
+    await this.requireOrgAgent(name);
+    const rows = await this.liveReleases(name);
+    if (rows.length === 0) throw new ApiError('NOT_FOUND', PRESET_MISSING);
+    const now = new Date();
     await this.db
-      .update(agentPresets)
-      .set({ status: 'rejected', reason, checksum: '', updatedAt: new Date() })
-      .where(eq(agentPresets.id, row.id));
-    await this.audit.log(username, 'agent_preset_reject', `${name}@${version}`);
-  }
-
-  /** 删除某 name 的全部版本 + 清授权。 */
-  async deleteAll(name: string, username: string): Promise<void> {
-    const rows = await this.db
-      .select()
-      .from(agentPresets)
-      .where(eq(agentPresets.name, name));
-    if (rows.length === 0) throw new ApiError('NOT_FOUND', '预设不存在');
-    await this.db.delete(agentPresets).where(eq(agentPresets.name, name));
-    await this.db.delete(agentPresetGrants).where(eq(agentPresetGrants.presetName, name));
+      .update(appReleases)
+      .set({ deletedAt: now, archive: null, size: 0, updatedAt: now })
+      .where(
+        and(
+          eq(appReleases.kind, KIND),
+          eq(appReleases.appId, name),
+          isNull(appReleases.deletedAt),
+        ),
+      );
+    await deleteAppGrants(this.db, KIND, name);
     await this.audit.log(username, 'agent_preset_delete', name);
+    return { ok: true };
   }
 
-  async deleteVersion(
-    name: string,
-    version: string,
-    username: string,
-  ): Promise<void> {
-    const [row] = await this.db
-      .select()
-      .from(agentPresets)
-      .where(and(eq(agentPresets.name, name), eq(agentPresets.version, version)))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '预设不存在');
-    await this.db.delete(agentPresets).where(eq(agentPresets.id, row.id));
-    const remaining = await this.db
-      .select({ id: agentPresets.id })
-      .from(agentPresets)
-      .where(eq(agentPresets.name, name))
-      .limit(1);
-    if (remaining.length === 0) {
-      await this.db.delete(agentPresetGrants).where(eq(agentPresetGrants.presetName, name));
-    }
+  async deleteVersion(name: string, version: string, username: string): Promise<{ ok: true }> {
+    await this.requireOrgAgent(name);
+    const ok = await softDeleteRelease(this.db, KIND, name, version);
+    if (!ok) throw new ApiError('NOT_FOUND', PRESET_MISSING);
     await this.audit.log(username, 'agent_preset_delete', `${name}@${version}`);
+    return { ok: true };
   }
 
   async setQuality(
     name: string,
     version: string,
-    quality: string,
+    rawQuality: string,
     username: string,
-  ): Promise<{ quality: string }> {
-    const [row] = await this.db
-      .select()
-      .from(agentPresets)
-      .where(and(eq(agentPresets.name, name), eq(agentPresets.version, version)))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '预设不存在');
-    if (quality !== '' && quality !== 'featured') {
-      throw new ApiError('VALIDATION', '质量标记不合法(空/featured)', 400);
+  ): Promise<{ ok: true; quality: string }> {
+    const quality = text(rawQuality);
+    if (!QUALITY_FLAGS.has(quality)) {
+      throw new ApiError('VALIDATION', '质量标记不合法(空/featured;官方已移交归属官方操作)');
     }
-    if (row.status !== 'approved') {
-      throw new ApiError('VALIDATION', '仅审核通过的版本可设置质量标记', 400);
-    }
-    await this.audit.log(username, 'agent_preset_qualify', `${name}@${version}`);
-    return { quality };
-  }
-
-  async file(
-    name: string,
-    version: string | undefined,
-    path: string,
-  ): Promise<{ path: string; size: number; binary: boolean; too_large: boolean; content: string }> {
-    const row = version
-      ? (
-          await this.db
-            .select()
-            .from(agentPresets)
-            .where(and(eq(agentPresets.name, name), eq(agentPresets.version, version)))
-            .limit(1)
-        )[0]
-      : await this.displayVersion(name);
-    if (!row) throw new ApiError('NOT_FOUND', '预设不存在');
-    const p = (path ?? '').replace(/\\/g, '/').replace(/^\/+/, '');
-    return { path: p, size: 0, binary: false, too_large: false, content: '' };
+    await this.requireOrgAgent(name);
+    const ok = await setReleaseQuality(this.db, KIND, name, version, quality);
+    if (!ok) throw new ApiError('NOT_FOUND', '预设不存在或未通过审核');
+    await this.audit.log(username, 'agent_preset_qualify', `${name}@${version}=${quality}`);
+    return { ok: true, quality };
   }
 
   async setEnabled(
     name: string,
-    body: { enabled?: boolean },
+    body: PresetEnabledBody,
     username: string,
-  ): Promise<{ enabled: boolean }> {
-    if (
-      body == null ||
-      typeof body !== 'object' ||
-      typeof body.enabled !== 'boolean'
-    ) {
-      throw new ApiError(
-        'VALIDATION',
-        '请求体格式错误(需要 {"enabled": true|false})',
-        400,
-      );
+  ): Promise<{ ok: true; enabled: boolean }> {
+    const enabled = body?.enabled;
+    if (typeof enabled !== 'boolean') {
+      throw new ApiError('VALIDATION', '请求体格式错误(需要 {"enabled": true|false})');
     }
-    const [row] = await this.db
-      .select()
-      .from(agentPresets)
-      .where(eq(agentPresets.name, name))
-      .limit(1);
-    if (!row) throw new ApiError('NOT_FOUND', '预设不存在');
-    await this.audit.log(
-      username,
-      body.enabled ? 'agent_preset_enable' : 'agent_preset_disable',
-      name,
-    );
-    return { enabled: body.enabled };
+    await this.requireOrgAgent(name);
+    const ok = await setAppEnabled(this.db, KIND, name, enabled);
+    if (!ok) throw new ApiError('NOT_FOUND', PRESET_MISSING);
+    await this.audit.log(username, enabled ? 'agent_preset_enable' : 'agent_preset_disable', name);
+    return { ok: true, enabled };
   }
 
-  // ------------------------------------------------------------ grants
-
   async listGrants(name: string): Promise<PresetGrantJSON[]> {
+    await this.requireOrgAgent(name);
+    return listAppGrants(this.db, KIND, name);
+  }
+
+  private async groupExists(name: string): Promise<boolean> {
     const rows = await this.db
-      .select()
-      .from(agentPresetGrants)
-      .where(eq(agentPresetGrants.presetName, name))
-      .orderBy(agentPresetGrants.granteeType, agentPresetGrants.grantee);
-    return rows.map((g) => ({ grantee_type: g.granteeType, grantee: g.grantee }));
+      .select({ name: groups.name })
+      .from(groups)
+      .where(sql`lower(${groups.name}) = ${name.toLowerCase()}`)
+      .limit(1);
+    return rows.length > 0;
+  }
+
+  private async userExists(name: string): Promise<boolean> {
+    const rows = await this.db
+      .select({ username: users.username })
+      .from(users)
+      .where(sql`lower(${users.username}) = ${name.toLowerCase()}`)
+      .limit(1);
+    return rows.length > 0;
   }
 
   async replaceGrants(
     name: string,
-    rawGroups: unknown,
+    rawGroups: string[] | undefined,
     username: string,
-  ): Promise<void> {
-    const list = Array.isArray(rawGroups) ? rawGroups.map(String) : [];
-    const cleaned: string[] = [];
-    for (const g of list) {
-      const n = normalizeGrantee(g);
-      if (!n) throw new ApiError('VALIDATION', '部门名不合法或不存在', 400);
-      if (!cleaned.includes(n)) cleaned.push(n);
+  ): Promise<{ ok: true }> {
+    const source = Array.isArray(rawGroups) ? rawGroups : [];
+    const names: string[] = [];
+    const seen = new Set<string>();
+    for (const item of source) {
+      const normalized = normalizeGrantee(typeof item === 'string' ? item : '');
+      if (!normalized) throw new ApiError('VALIDATION', '部门名不合法或不存在');
+      const key = normalized.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      names.push(normalized);
     }
-    for (const g of cleaned) {
-      const [exists] = await this.db
-        .select({ id: groups.id })
-        .from(groups)
-        .where(sql`lower(${groups.name}) = ${g.toLowerCase()}`)
-        .limit(1);
-      if (!exists) throw new ApiError('VALIDATION', '部门名不合法或不存在', 400);
-    }
-    await this.db.transaction(async (tx) => {
-      await tx
-        .delete(agentPresetGrants)
-        .where(
-          and(
-            eq(agentPresetGrants.presetName, name),
-            eq(agentPresetGrants.granteeType, 'group'),
-          ),
-        );
-      for (const g of cleaned) {
-        await tx
-          .insert(agentPresetGrants)
-          .values({ presetName: name, granteeType: 'group', grantee: g })
-          .onConflictDoNothing();
-      }
-    });
+    await this.requireOrgAgent(name);
+    const outcome = await replaceGroupGrants(this.db, KIND, name, names, (group) =>
+      this.groupExists(group),
+    );
+    if (outcome !== 'ok') throw new ApiError('VALIDATION', '部门名不合法或不存在');
     await this.audit.log(username, 'agent_preset_grant', name);
+    return { ok: true };
   }
 
-  async grant(
-    name: string,
-    body: { username?: string; group?: string },
-    username: string,
-  ): Promise<void> {
-    const hasUser = body?.username != null && body.username !== '';
-    const raw = hasUser ? body!.username! : (body?.group ?? '');
-    const grantee = normalizeGrantee(raw);
-    if (!grantee) throw new ApiError('VALIDATION', '授权对象不合法', 400);
-    const granteeType = hasUser ? ('user' as const) : ('group' as const);
-    if (granteeType === 'group') {
-      const [exists] = await this.db
-        .select({ id: groups.id })
-        .from(groups)
-        .where(sql`lower(${groups.name}) = ${grantee.toLowerCase()}`)
-        .limit(1);
-      if (!exists) throw new ApiError('VALIDATION', '部门名不合法或不存在', 400);
-    }
-    await this.db
-      .insert(agentPresetGrants)
-      .values({ presetName: name, granteeType, grantee })
-      .onConflictDoNothing();
-    await this.audit.log(username, 'agent_preset_grant', `${name}:${granteeType}:${grantee}`);
+  private subjectOf(body: PresetGrantBody): { grantee: string; type: 'user' | 'group' } {
+    const granteeName = text(body?.username);
+    const groupName = text(body?.group);
+    if (!granteeName && !groupName) throw new ApiError('VALIDATION', '缺少授权主体');
+    const grantee = normalizeGrantee(granteeName || groupName);
+    if (!grantee) throw new ApiError('VALIDATION', '授权主体不合法');
+    return { grantee, type: granteeName ? 'user' : 'group' };
   }
 
-  async revoke(
-    name: string,
-    body: { username?: string; group?: string },
-    username: string,
-  ): Promise<void> {
-    const hasUser = body?.username != null && body.username !== '';
-    const raw = hasUser ? body!.username! : (body?.group ?? '');
-    const grantee = normalizeGrantee(raw);
-    if (!grantee) throw new ApiError('VALIDATION', '授权对象不合法', 400);
-    const granteeType = hasUser ? ('user' as const) : ('group' as const);
-    await this.db
-      .delete(agentPresetGrants)
-      .where(
-        and(
-          eq(agentPresetGrants.presetName, name),
-          eq(agentPresetGrants.granteeType, granteeType),
-          eq(agentPresetGrants.grantee, grantee),
-        ),
-      );
-    await this.audit.log(username, 'agent_preset_revoke', `${name}:${granteeType}:${grantee}`);
+  async grant(name: string, body: PresetGrantBody, username: string): Promise<{ ok: true }> {
+    const subject = this.subjectOf(body);
+    await this.requireOrgAgent(name);
+    const exists =
+      subject.type === 'user'
+        ? await this.userExists(subject.grantee)
+        : await this.groupExists(subject.grantee);
+    if (!exists) throw new ApiError('VALIDATION', '授权主体不存在');
+    const ok = await grantApp(this.db, KIND, name, subject.grantee, subject.type);
+    if (!ok) throw new ApiError('VALIDATION', '授权主体不合法');
+    await this.audit.log(username, 'agent_preset_grant', `${name}@${subject.type}:${subject.grantee}`);
+    return { ok: true };
+  }
+
+  async revoke(name: string, body: PresetGrantBody, username: string): Promise<{ ok: true }> {
+    const subject = this.subjectOf(body);
+    await this.requireOrgAgent(name);
+    await revokeApp(this.db, KIND, name, subject.grantee, subject.type);
+    await this.audit.log(username, 'agent_preset_revoke', `${name}@${subject.type}:${subject.grantee}`);
+    return { ok: true };
   }
 }

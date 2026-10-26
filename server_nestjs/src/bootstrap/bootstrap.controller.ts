@@ -14,7 +14,12 @@ export class BootstrapController {
 
   @Get('bootstrap')
   bootstrap(@CurrentUser() user: ClientPrincipal): Promise<Record<string, unknown>> {
-    return this.svc.build({ userId: user.userId, username: user.username, role: user.role });
+    return this.svc.build({
+      userId: user.userId,
+      username: user.username,
+      role: user.role,
+      isAdmin: user.isAdmin ?? 0,
+    });
   }
 }
 
