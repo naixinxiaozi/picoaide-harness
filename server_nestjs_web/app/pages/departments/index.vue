@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import type { SessionUser } from '~/lib/nav'
 
+const UButton = resolveComponent('UButton')
+
 interface DepartmentItem {
   id: number
   name: string
@@ -11,6 +13,7 @@ interface DepartmentItem {
   member_count: number
   child_count: number
   granted_count: number
+  children?: DepartmentItem[] | null
 }
 
 interface UserItem {
@@ -44,11 +47,39 @@ const error = ref('')
 const leaders = ref<UserItem[]>([])
 const leadersLoaded = ref(false)
 
+const expanded = ref({ 0: true })
+
 const columns = [
-  { accessorKey: 'name', header: '名称' },
-  { accessorKey: 'parent', header: '父部门' },
+  { accessorKey: 'name', header: '名称', cell: ({ row }) => {
+      return h(
+        'div',
+        {
+          style: {
+            paddingInlineStart: `${row.depth * 2}rem`
+          },
+          class: 'flex items-center gap-2'
+        },
+        [
+          h(UButton, {
+            color: 'neutral',
+            variant: 'outline',
+            size: 'xs',
+            icon: row.getIsExpanded() ? 'i-lucide-minus' : 'i-lucide-plus',
+            class: !row.getCanExpand() && 'invisible',
+            ui: {
+              base: 'p-0 rounded-sm',
+              leadingIcon: 'size-4'
+            },
+            onClick: row.getToggleExpandedHandler()
+          }),
+          row.getValue('name') as string
+        ]
+      )
+    }},
+  { accessorKey: 'parent', header: '上级部门' },
   { accessorKey: 'leader', header: '主管' },
   { accessorKey: 'member_count', header: '成员数' },
+  { accessorKey: 'child_count', header: '下级部门' },
   { id: 'actions', header: '操作' },
 ]
 
@@ -199,7 +230,13 @@ async function submitDelete() {
       @update:open="error = ''"
     />
 
-    <UTable :data="departments" :columns="columns" :loading="loading">
+    <UTable v-model:expanded="expanded" :data="departments" :columns="columns" :loading="loading" :get-sub-rows="(row) => row.children || []" class="flex-1"
+      :ui="{
+      base: 'border-separate border-spacing-0',
+      tbody: '[&>tr]:last:[&>td]:border-b-0',
+      tr: 'group',
+      td: 'empty:p-0 group-has-[td:not(:empty)]:border-b border-default'
+    }">
       <template #parent-cell="{ row }">
         <span class="text-muted-foreground">{{ parentName(row.original.parent_id) }}</span>
       </template>

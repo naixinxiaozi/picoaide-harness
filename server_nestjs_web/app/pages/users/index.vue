@@ -515,12 +515,13 @@ async function onRevokeToken(token: TokenItem) {
     <UModal v-model:open="assignOpen" :title="`分配部门 - ${assigning?.username ?? ''}`">
       <template #body>
         <div class="space-y-4">
-          <USelect
+          <!-- <USelect
             v-model="assignSelected"
             :items="departmentItems"
             multiple
             placeholder="选择部门（可多选）"
-          />
+          /> -->
+          <TreeSelect v-model="assignSelected" multiple :options="departmentItems"/>
           <p class="text-xs text-muted-foreground">部门分配为替换式设置，清空选择即移除该用户的全部部门归属。</p>
           <p v-if="assignError" class="text-sm text-error">{{ assignError }}</p>
           <div class="flex justify-end gap-2">

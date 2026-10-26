@@ -17,6 +17,8 @@ export interface DepartmentInfo {
   member_count: number;
   child_count: number;
   granted_count: number;
+  level: number
+  children?: DepartmentInfo[] | null
 }
 
 export interface DeptBody {
@@ -82,11 +84,12 @@ export class DepartmentsService {
         member_count: Number(r.member_count),
         child_count: Number(r.child_count),
         granted_count: Number(r.granted_count),
+        level: 0
       };
       if (r.leader_name) d.leader_name = r.leader_name;
       deps.push(d);
     }
-    return deps;
+    return arrayToTree(deps);
   }
 
   async create(body: DeptBody, actor: string): Promise<{ id: number; name: string }> {
@@ -280,6 +283,22 @@ export class DepartmentsService {
     }
     return result;
   }
+}
+
+function arrayToTree(arr: DepartmentInfo[], pid = 0) {
+  const newArr: DepartmentInfo[] = []
+  arr.forEach((v) => {
+    if (v.parent_id === pid) {
+      const children = arrayToTree(arr, v.id)
+      newArr.push({
+        ...v,
+        level: v.level + 1,
+        children: children.length > 0 ? children : null
+      })
+    }
+  })
+
+  return newArr
 }
 
 /** 唯一索引冲突（PG 23505）→ 400 部门名称已存在；其余原样抛出。 */
