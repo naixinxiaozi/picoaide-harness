@@ -1,8 +1,12 @@
 <template>
   <div class="flex h-screen overflow-hidden">
-    <aside class="flex w-60 shrink-0 flex-col border-r bg-muted/20">
-      <div class="flex h-14 items-center border-b px-4">
-        <span class="text-sm font-semibold">PicoAide 管理台</span>
+    <aside class="flex w-60 shrink-0 flex-col border-r bg-default/75 border-default">
+      <div class="flex h-14 items-center border-b border-default px-4">
+        <span
+            class="inline-flex items-center justify-center select-none overflow-hidden rounded-full align-middle bg-elevated size-6 text-[10px] shrink-0">
+            <img :src="logUrl" width="24" height="24" class="h-full w-full rounded-[inherit] object-cover" alt="Nuxt" />
+          </span>
+        <span class=" ml-1 text-lg font-semibold">PicoAide 管理台</span>
       </div>
       <nav class="flex-1 space-y-5 overflow-y-auto p-3">
         <div v-for="section in sections" :key="section.name" class="space-y-1">
@@ -19,7 +23,7 @@
           </NuxtLink>
         </div>
       </nav>
-      <div class="flex h-14 items-center justify-between border-t px-4">
+      <div class="flex h-14 items-center justify-between border-t border-default px-4">
         <span class="truncate text-sm">{{ user?.display_name || user?.username }}</span>
         <UButton
           size="sm"
@@ -40,6 +44,7 @@
 <script setup lang="ts">
 import { visibleNav, type SessionUser } from '~/lib/nav'
 
+const logUrl = '/images/nuxt.png'
 const { data, signOut } = useAuth()
 const user = computed<SessionUser | null>(() => (data.value as SessionUser | null) ?? null)
 
