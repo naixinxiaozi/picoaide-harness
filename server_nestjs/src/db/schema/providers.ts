@@ -10,8 +10,11 @@ import {
   uniqueIndex,
 } from 'drizzle-orm/pg-core';
 
-/** 上游协议：OpenAI 兼容（默认）/ Anthropic 兼容（/v1/messages 专用）。 */
-export const PROVIDER_PROTOCOL = ['openai', 'anthropic'] as const;
+/**
+ * 上游协议：OpenAI 兼容（默认）/ Anthropic 兼容（/v1/messages 专用）/
+ * both（同一上游同时提供两种协议）。与 Go 服务端 `admin.go` 的校验集合保持一致。
+ */
+export const PROVIDER_PROTOCOL = ['openai', 'anthropic', 'both'] as const;
 export type ProviderProtocol = (typeof PROVIDER_PROTOCOL)[number];
 
 export const gatewayProviders = pgTable(

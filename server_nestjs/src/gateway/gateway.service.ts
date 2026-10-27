@@ -24,6 +24,7 @@ import {
   type UsageKind,
   type User,
   type LedgerKind,
+  type ProviderProtocol,
 } from '../db/schema';
 import { SettingsService } from '../settings/settings.service';
 import { CryptoService } from '../common/crypto/crypto.service';
@@ -56,7 +57,7 @@ interface Upstream {
   baseUrl: string;
   apiKey: string;
   channel: string;
-  protocol: 'openai' | 'anthropic';
+  protocol: ProviderProtocol;
 }
 
 interface Refusal {
@@ -101,6 +102,20 @@ function upstreamURL(base: string, path: string): string {
   let b = base.replace(/\/+$/, '');
   if (!b.endsWith('/v1')) b += '/v1';
   return b + path;
+}
+
+/**
+ * Anthropic 兼容端点基址推导（与 Go `anthropicBaseURL` 对齐）：
+ * - both：base 是 OpenAI 端点（如 `https://api.deepseek.com`），Anthropic 端点位于
+ *   `{base}/anthropic/v1`；若 base 已显式含 `/anthropic` 则原样使用。
+ * - anthropic：base 就是管理员填写的 Anthropic 端点，原样使用（不推导）。
+ * - openai：不会走到这里。
+ */
+function anthropicBaseURL(base: string, protocol: ProviderProtocol): string {
+  const b = base.replace(/\/+$/, '');
+  if (protocol !== 'both') return b;
+  if (b.includes('/anthropic')) return b;
+  return `${b}/anthropic/v1`;
 }
 
 function satAdd(a: number, b: number): number {
@@ -355,7 +370,14 @@ export class GatewayService {
     const providers = await this.db
       .select()
       .from(gatewayProviders)
-      .where(and(eq(gatewayProviders.enabled, 1), eq(gatewayProviders.protocol, protocol)))
+      .where(
+        and(
+          eq(gatewayProviders.enabled, 1),
+          // protocol='both' 的上游同时提供 OpenAI 与 Anthropic 两种协议（与 Go
+          // MatchModelsByProtocol 对齐）；只精确匹配会让 both 上游对任何协议都不可见。
+          or(eq(gatewayProviders.protocol, protocol), eq(gatewayProviders.protocol, 'both')),
+        ),
+      )
       .orderBy(gatewayProviders.id);
     const synced = await this.db
       .select({ providerId: models.providerId })
@@ -752,7 +774,10 @@ export class GatewayService {
           isNotNull(users.balanceActivatedAt),
           or(
             sql`${users.balanceMoney} + ${delta} >= ${-BALANCE_FLOOR_EPSILON}`,
-            sql`${delta} >= 0`,
+            // 必须显式 ::float8：直接 `$n >= 0` 会让 PG 把参数推断成 integer，
+            // 传入小数（如 -0.00031）时报 22P02 invalid input syntax for type integer。
+            // Go 侧同一处以 `?::numeric >= 0` 规避（server/internal/serverstore/balance.go:279）。
+            sql`${delta}::float8 >= 0`,
           ),
         ),
       )
@@ -794,7 +819,10 @@ export class GatewayService {
     protocol: 'openai' | 'anthropic',
     anthropicVersion: string | undefined,
   ): Promise<globalThis.Response | null> {
-    const url = upstreamURL(up.baseUrl, endpoint);
+    const url =
+      endpoint === '/messages'
+        ? upstreamURL(anthropicBaseURL(up.baseUrl, up.protocol), endpoint)
+        : upstreamURL(up.baseUrl, endpoint);
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (protocol === 'anthropic') {
       headers['x-api-key'] = up.apiKey;
@@ -1203,6 +1231,7 @@ export class GatewayService {
     try {
       await this.recordUsageAndSettle(userId, providerId, model, pt, ct, cache, search, kind, estimated);
     } catch (e) {
+      this.logger.error(`metering failed user=${userId} model=${model}: ${(e as Error).stack ?? e}`);
       if (e instanceof ApiError && e.code === 'BALANCE_EXHAUSTED') {
         this.raiseAdmissionFloor(userId, 0);
         res
@@ -1250,6 +1279,7 @@ export class GatewayService {
     try {
       await this.recordUsageAndSettle(userId, providerId, model, tokens, 0, 0, 0, 'embedding', estimated);
     } catch (e) {
+      this.logger.error(`embedding metering failed user=${userId} model=${model}: ${(e as Error).stack ?? e}`);
       if (e instanceof ApiError && e.code === 'BALANCE_EXHAUSTED') {
         res
           .status(429)
@@ -1359,6 +1389,7 @@ export class GatewayService {
         true,
       );
     } catch (e) {
+      this.logger.error(`stream metering failed user=${userId} model=${model}: ${(e as Error).stack ?? e}`);
       const body = res as unknown as { write: (s: string) => void };
       if (e instanceof ApiError && e.code === 'BALANCE_EXHAUSTED') {
         body.write('data: {"error":{"code":"BALANCE_EXHAUSTED","message":"余额不足,本次调用未完成:请联系管理员充值"}}\n\n');

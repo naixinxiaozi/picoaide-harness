@@ -33,21 +33,28 @@ export class CryptoService implements OnModuleInit {
     this.masterKey = this.loadMasterKey();
   }
 
-  /** 主密钥来源：文件 > ENV 明文 > 管理员密码派生（开发回退）。 */
+  /**
+   * 主密钥来源：文件 > ENV > 管理员密码派生（开发回退）。
+   *
+   * 与 Go 服务端 `internal/util/crypto.go` 的 `parseKey` 严格对齐：
+   * master.key 文件里是**原始字节**（32 字节随机数），不是文本；16/24/32
+   * 字节的密钥材料直接作为 AES key，**不能再做哈希**——哈希会得到另一把
+   * 密钥，导致无法解密 Go 写入的 api_key_enc（表现为上游密钥解密失败、
+   * provider 被跳过、对话 404）。
+   */
   private loadMasterKey(): Buffer {
     const { masterKeyFile, masterKey, adminPassword } = this.config;
-    let material: string | null = null;
 
     if (masterKeyFile && existsSync(masterKeyFile)) {
-      material = readFileSync(masterKeyFile, 'utf8').trim();
-    } else if (masterKey) {
-      material = masterKey;
-    } else {
-      this.logger.warn('未配置 master key，回退到管理员密码派生（仅开发）');
-      material = adminPassword;
+      const raw = readFileSync(masterKeyFile);
+      return parseMasterKey(raw, masterKeyFile);
+    }
+    if (masterKey) {
+      return parseMasterKey(Buffer.from(masterKey, 'utf8'), 'MASTER_KEY');
     }
 
-    return createHash('sha256').update(material ?? '').digest();
+    this.logger.warn('未配置 master key，回退到管理员密码派生（仅开发）');
+    return createHash('sha256').update(adminPassword ?? '').digest();
   }
 
   /** AES-256-GCM 加密 → `enc:v1:<base64(iv|cipher|tag)>`。 */
@@ -109,4 +116,16 @@ export class CryptoService implements OnModuleInit {
       return false;
     }
   }
+}
+
+/**
+ * 校验并返回 AES 主密钥（与 Go `util.parseKey` 同口径）。
+ * 长度必须是 16/24/32 字节；不合法直接抛错（fail-loud），不做静默哈希回退，
+ * 否则会与 Go 服务端产生不可察觉的密钥分叉。
+ */
+function parseMasterKey(material: Buffer, source: string): Buffer {
+  if (material.length === 16 || material.length === 24 || material.length === 32) {
+    return material;
+  }
+  throw new Error(`master key must be 16/24/32 bytes, got ${material.length} (${source})`);
 }

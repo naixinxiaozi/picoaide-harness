@@ -1,7 +1,13 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { and, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DRIZZLE, type Database } from '../db/database.module';
-import { gatewayProviders, models, settings } from '../db/schema';
+import {
+  gatewayProviders,
+  models,
+  settings,
+  PROVIDER_PROTOCOL,
+  type ProviderProtocol,
+} from '../db/schema';
 import { CryptoService } from '../common/crypto/crypto.service';
 import { SettingsService } from '../settings/settings.service';
 import { AuditService } from '../audit/audit.service';
@@ -91,9 +97,7 @@ export class ProvidersService {
     const enabled = body.enabled === undefined ? true : !!body.enabled;
 
     if (!name || !baseUrl) throw new ApiError('VALIDATION', '名称和 base_url 必填');
-    if (protocol !== 'openai' && protocol !== 'anthropic') {
-      throw new ApiError('VALIDATION', 'protocol 仅支持 openai/anthropic');
-    }
+    assertProviderProtocol(protocol);
     validateBaseURL(baseUrl);
     if (channel && !apiKey) throw new ApiError('VALIDATION', '渠道型上游必须填写 API Key');
     if (apiKey === MASK) throw new ApiError('VALIDATION', 'api_key 是掩码值:请填写真实密钥');
@@ -121,7 +125,7 @@ export class ProvidersService {
           models: JSON.stringify(rawModels),
           enabled: enabled ? 1 : 0,
           channel,
-          protocol: protocol as 'openai' | 'anthropic',
+          protocol,
         })
         .returning();
       const p = rows[0];
@@ -166,9 +170,7 @@ export class ProvidersService {
     const enabled = body.enabled === undefined ? existing.enabled === 1 : !!body.enabled;
 
     if (!name) throw new ApiError('VALIDATION', 'name 不能为空');
-    if (protocol !== 'openai' && protocol !== 'anthropic') {
-      throw new ApiError('VALIDATION', 'protocol 仅支持 openai/anthropic');
-    }
+    assertProviderProtocol(protocol);
     if (baseUrl) validateBaseURL(baseUrl);
 
     const apiKeyChanged = typeof body.api_key === 'string' && body.api_key !== '' && body.api_key !== MASK;
@@ -189,7 +191,7 @@ export class ProvidersService {
           models: rawModels ? JSON.stringify(rawModels) : existing.models,
           enabled: enabled ? 1 : 0,
           channel,
-          protocol: protocol as 'openai' | 'anthropic',
+          protocol,
         })
         .where(eq(gatewayProviders.id, id));
       if (rawModels && !channel) {
@@ -416,4 +418,11 @@ function validateBaseURL(raw: string): void {
 
 function trimSlash(s: string): string {
   return s.replace(/\/+$/, '');
+}
+
+/** 校验上游协议并收窄类型：与 Go `admin.go` 一致，允许 openai/anthropic/both。 */
+function assertProviderProtocol(protocol: string): asserts protocol is ProviderProtocol {
+  if (!(PROVIDER_PROTOCOL as readonly string[]).includes(protocol)) {
+    throw new ApiError('VALIDATION', 'protocol 仅支持 openai/anthropic/both');
+  }
 }
