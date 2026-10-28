@@ -16,6 +16,8 @@ export class ApiError extends Error {
 
 export function useApi() {
   const { token } = useAuth()
+  const runtimeConfig = useRuntimeConfig()
+  const baseURL = runtimeConfig.public.apiBase
 
   function resolveError(e: unknown): ApiError {
     const err = e as { data?: ApiErrorBody; message?: string }
@@ -35,7 +37,7 @@ export function useApi() {
       headers['X-CSRF-Token'] = token.value
     }
     try {
-      return await $fetch<T>(path, {
+      return await $fetch<T>(baseURL + path, {
         method,
         headers,
         body: opts.body as undefined,

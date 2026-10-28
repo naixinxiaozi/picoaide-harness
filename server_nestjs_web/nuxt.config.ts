@@ -10,7 +10,7 @@ export default defineNuxtConfig({
   },
   auth: {
     isEnabled: true,
-    baseURL: '',
+    baseURL: process.env.NUXT_PUBLIC_API_BASE,
     provider: {
       type: 'local',
       endpoints: {
@@ -56,7 +56,7 @@ export default defineNuxtConfig({
   },
   runtimeConfig: {
     public: {
-      apiBase: '',
+      apiBase: process.env.NUXT_PUBLIC_API_BASE ?? '',
     },
   },
 })
