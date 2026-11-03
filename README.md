@@ -183,6 +183,7 @@ PicoAide Harness 没有魔改上游源码，也不是一个固定写死的外壳
 ```sh
 git submodule update --init --recursive
 corepack yarn install --immutable
+corepack yarn prebuild
 corepack yarn dev
 ```
 

@@ -325,7 +325,7 @@
     "@picoaide/dsh-host-locale": "workspace:*",
     "@picoaide/dsh-wasm-apps": "workspace:*",
     "@picoaide/dsh-wasm-apps-host": "workspace:*",
-    "adm-zip": "^0.6.0",
+    "adm-zip": "^0.6.1",
     "dsh-memory-evolve": "workspace:*",
     "koffi": "3.1.5",
     "node-addon-require-builtin": "^0.1.6",
