@@ -107,7 +107,7 @@
     "@picoaide/dsh-gateway-client": "workspace:*",
     "@picoaide/dsh-host-locale": "workspace:*",
     "@sentry/node": "^7.120.0",
-    "adm-zip": "^0.6.0",
+    "adm-zip": "^0.6.1",
     "tar": "^7.5.0",
     "yaml": "^2.9.0"
   },
